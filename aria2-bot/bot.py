@@ -70,6 +70,13 @@ def is_owner(user_id: int) -> bool:
     return config.OWNER_ID and user_id == config.OWNER_ID
 
 
+async def safe_edit(msg, text, reply_markup=None):
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning("safe_edit ignored: %s", e)
+
+
 def allowed(user_id: int) -> bool:
     return db.is_allowed(user_id)
 
@@ -147,9 +154,7 @@ def welcome_text(name: str = "there") -> str:
         "🎥 <b>YouTube</b> — send a link and choose Audio (MP3) or Video (MP4).\n"
         "🔀 <b>Format menu</b> — when a source has many formats, I'll show you a choice.\n"
         "🖼️ <b>Thumbnails</b> — send a photo to save your thumbnail, <code>/thumb</code> to view it.\n\n"
-        "🔄 <b>Caching</b> — files are saved in the owner's private channel; same link within 7 days is resent instantly. Nothing stays on the server.\n"
-        "📦 <b>Large files</b> — up to 2 GiB in one piece, bigger files split into &lt;1.5 GiB parts.\n"
-        "🔒 <b>Privacy</b> — your files go only to you (and the storage channel), never shared.\n\n"
+        "📦 <b>Large files</b> — up to 2 GiB in one piece, bigger files split into &lt;1.5 GiB parts.\n\n"
         "🔤 <b>Commands</b>\n"
         "/help — all abilities & link formats\n"
         "/about — about this bot\n"
@@ -418,9 +423,24 @@ async def handle_text(message: Message):
 @dp.message(F.document | F.video_note)
 @guard
 async def handle_torrent_file(message: Message):
+    if message.document and message.document.file_name and message.document.file_name.lower() == "cookies.txt":
+        if not is_owner(message.from_user.id):
+            await message.answer("❌ Only the owner can update the cookies file.")
+            return
+        cookies_path = config.YTDLP_COOKIES
+        if not cookies_path:
+            await message.answer("❌ YTDLP_COOKIES is not configured in .env.")
+            return
+        buf = await bot.download(message.document)
+        data = buf.getvalue() if hasattr(buf, "getvalue") else buf
+        with open(cookies_path, "wb") as f:
+            f.write(data)
+        await message.answer(f"✅ Cookies file updated ({len(data)} bytes). YouTube downloads will use it.")
+        return
     if message.document and message.document.file_name and message.document.file_name.endswith(".torrent"):
         buf = await bot.download(message.document)
-        b64 = base64.b64encode(buf).decode()
+        data = buf.getvalue() if hasattr(buf, "getvalue") else buf
+        b64 = base64.b64encode(data).decode()
         try:
             gid = await aria2.add_torrent(b64)
         except RuntimeError as e:
@@ -472,10 +492,18 @@ async def process_link(message: Message, raw_text: str):
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
+        try:
+            info = await ytdlp.probe_url(parsed, config)
+            options = ytdlp.build_youtube_quality_options(info)
+            if options:
+                token = store.create_request("ytdlp_selection", parsed, options, info)
+                await message.answer("🎥 <b>YouTube detected</b> — pick a quality/format:", reply_markup=format_kb(token))
+                return
+        except Exception as e:
+            logger.info("YouTube probe failed, falling back to quick flow: %s", e)
         token = store.create_request("youtube_quick", parsed, ytdlp.build_quick_youtube_options())
         await message.answer("🎥 <b>YouTube link detected</b> — how do you want it?", reply_markup=format_kb(token))
         return
-
     # Mega / MediaFire get dedicated downloaders
     if kind == "mega":
         options = [{"option_id": "mega", "label": "🅼 Download from Mega", "send_type": "document", "mode": "mega"}]
@@ -1093,11 +1121,11 @@ async def on_admin_cb(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Select a user to remove:", reply_markup=kb)
     elif action == "list":
         await cb.answer()
-        await cb.message.edit_text(admin_panel_text(), reply_markup=admin_panel_kb())
+        await safe_edit(cb.message, admin_panel_text(), admin_panel_kb())
     elif action == "home":
         await cb.answer()
         await state.clear()
-        await cb.message.edit_text(admin_panel_text(), reply_markup=admin_panel_kb())
+        await safe_edit(cb.message, admin_panel_text(), admin_panel_kb())
     else:
         await cb.answer()
 

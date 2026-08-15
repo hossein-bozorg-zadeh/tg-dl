@@ -26,15 +26,15 @@ def humanbytes(size: int) -> str:
     return f"{size:.0f} B"
 
 
-def _command_base(parsed_input, settings) -> list[str]:
+def _command_base(parsed_input, settings, use_cookies: bool = True) -> list[str]:
     command = ["yt-dlp", "--no-warnings"]
-    proxies = getattr(settings, "ytdlp_proxies", []) or []
+    proxies = getattr(settings, "YTDLP_PROXIES", None) or []
     if proxies:
         command.extend(["--proxy", random.choice(proxies)])
-    elif getattr(settings, "http_proxy", ""):
-        command.extend(["--proxy", settings.http_proxy])
-    cookies = getattr(settings, "ytdlp_cookies", "")
-    if cookies and Path(cookies).is_file():
+    elif getattr(settings, "HTTP_PROXY", ""):
+        command.extend(["--proxy", settings.HTTP_PROXY])
+    cookies = getattr(settings, "YTDLP_COOKIES", "")
+    if use_cookies and cookies and Path(cookies).is_file():
         command.extend(["--cookies", cookies])
     if parsed_input.username:
         command.extend(["--username", parsed_input.username])
@@ -117,7 +117,7 @@ def _option_id(prefix: str, index: int) -> str:
 
 
 async def probe_url(parsed_input, settings) -> dict:
-    command = _command_base(parsed_input, settings)
+    command = _command_base(parsed_input, settings, use_cookies=False)
     command.extend(["--dump-single-json", parsed_input.source_url])
     stdout, _ = await _run_command(command)
     if "\n" in stdout:
@@ -130,6 +130,54 @@ def build_quick_youtube_options() -> list[dict]:
         {"option_id": "quick_audio", "label": "🎵 Audio (MP3)", "send_type": "audio", "mode": "youtube_quick"},
         {"option_id": "quick_video", "label": "🎬 Video (MP4)", "send_type": "video", "mode": "youtube_quick"},
     ]
+
+
+def build_youtube_quality_options(info: dict) -> list[dict]:
+    """Build a quality/format selection menu for YouTube links."""
+    options: list[dict] = []
+    formats = info.get("formats") or []
+    heights: dict[int, dict] = {}
+    for f in formats:
+        h = f.get("height")
+        vcodec = f.get("vcodec")
+        if not h or vcodec in (None, "none"):
+            continue
+        entry = heights.setdefault(h, {"height": h, "exts": set(), "size": 0})
+        if f.get("ext"):
+            entry["exts"].add(f["ext"])
+        size = f.get("filesize") or f.get("filesize_approx") or 0
+        entry["size"] = max(entry["size"], size)
+    ordered = sorted(heights.values(), key=lambda e: e["height"], reverse=True)
+    for idx, entry in enumerate(ordered[:12]):
+        exts = sorted(entry["exts"], key=lambda e: 0 if e == "mp4" else (1 if e == "webm" else 2))
+        ext_label = exts[0] if exts else "mp4"
+        label = f"🎬 {entry['height']}p ({ext_label})"
+        size = entry.get("size") or 0
+        if size:
+            label += f" {humanbytes(size)}"
+        options.append(
+            {
+                "option_id": f"ytq{idx}",
+                "label": label,
+                "send_type": "video",
+                "mode": "youtube_quality",
+                "height": entry["height"],
+                "file_ext": ext_label,
+            }
+        )
+    if info.get("duration"):
+        for quality in ("64k", "128k", "320k"):
+            options.append(
+                {
+                    "option_id": f"yta{len(options)}",
+                    "label": f"🎵 MP3 ({quality})",
+                    "send_type": "audio",
+                    "mode": "ytdlp_audio",
+                    "file_ext": "mp3",
+                    "audio_quality": quality,
+                }
+            )
+    return options
 
 
 def build_ytdlp_options(info: dict) -> list[dict]:
@@ -226,22 +274,41 @@ def _caption_from_info(info: dict, fallback: str) -> str:
     return title or fallback
 
 
+def _is_bot_detected(error: Exception) -> bool:
+    text = str(error)
+    return "Sign in to confirm" in text or "not a bot" in text.lower()
+
+
+async def _download_with_retry(build_command, cwd: Path, progress_cb=None) -> None:
+    """Run yt-dlp without cookies first; retry with cookies if bot-detection triggers."""
+    try:
+        await _run_command_with_progress(build_command(use_cookies=False), cwd=cwd, progress_cb=progress_cb)
+    except RuntimeError as e:
+        if not _is_bot_detected(e):
+            raise
+        logger.info("bot-detection without cookies, retrying with cookies: %s", e)
+        await _run_command_with_progress(build_command(use_cookies=True), cwd=cwd, progress_cb=progress_cb)
+
+
 async def download_quick_youtube(parsed_input, option: dict, settings, work_dir: Path, progress_cb=None) -> dict:
     info = await probe_url(parsed_input, settings)
     work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
-    command = _command_base(parsed_input, settings)
-    command.extend(["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"])
+    args = ["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"]
     output_template = str(work_dir / "%(title)s [%(id)s].%(ext)s")
     if option.get("option_id") == "quick_audio":
-        command.extend(
+        args.extend(
             ["-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", output_template, parsed_input.source_url]
         )
         send_type = "audio"
     else:
-        command.extend(["-f", "best[ext=mp4]/best", "-o", output_template, parsed_input.source_url])
+        args.extend(["-f", "best[ext=mp4]/best", "-o", output_template, parsed_input.source_url])
         send_type = "video"
-    await _run_command_with_progress(command, cwd=work_dir, progress_cb=progress_cb)
+    await _download_with_retry(
+        lambda use_cookies: _command_base(parsed_input, settings, use_cookies=use_cookies) + args,
+        cwd=work_dir,
+        progress_cb=progress_cb,
+    )
     file_path = _pick_downloaded_file(work_dir)
     return {
         "path": file_path,
@@ -254,11 +321,10 @@ async def download_quick_youtube(parsed_input, option: dict, settings, work_dir:
 async def download_selected_format(parsed_input, option: dict, info: dict, settings, work_dir: Path, progress_cb=None) -> dict:
     work_dir = work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
-    command = _command_base(parsed_input, settings)
-    command.extend(["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"])
+    args = ["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"]
     output_template = str(work_dir / "%(title)s [%(id)s].%(ext)s")
     if option.get("mode") == "ytdlp_audio":
-        command.extend(
+        args.extend(
             [
                 "--extract-audio",
                 "--audio-format",
@@ -271,13 +337,22 @@ async def download_selected_format(parsed_input, option: dict, info: dict, setti
             ]
         )
         send_type = "audio"
+    elif option.get("mode") == "youtube_quality":
+        height = int(option.get("height") or 1080)
+        format_selector = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+        args.extend(["-f", format_selector, "--merge-output-format", "mp4", "-o", output_template, parsed_input.source_url])
+        send_type = "video"
     else:
         format_selector = option.get("format_id") or "best"
         if "youtube" in parsed_input.source_url or "youtu.be" in parsed_input.source_url:
             format_selector = f"{format_selector}+bestaudio"
-        command.extend(["-f", format_selector, "--embed-subs", "-o", output_template, parsed_input.source_url])
+        args.extend(["-f", format_selector, "--embed-subs", "-o", output_template, parsed_input.source_url])
         send_type = option.get("send_type", "video")
-    await _run_command_with_progress(command, cwd=work_dir, progress_cb=progress_cb)
+    await _download_with_retry(
+        lambda use_cookies: _command_base(parsed_input, settings, use_cookies=use_cookies) + args,
+        cwd=work_dir,
+        progress_cb=progress_cb,
+    )
     file_path = _pick_downloaded_file(work_dir)
     return {
         "path": file_path,
