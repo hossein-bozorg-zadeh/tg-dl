@@ -44,6 +44,17 @@ CHUNK_SIZE: int = (lambda v: v * 1024 if v < 1024 else v)(int(os.getenv("CHUNK_S
 # Proxy for network requests + yt-dlp (optional)
 HTTP_PROXY: str = os.getenv("HTTP_PROXY", "").strip()
 
+# Comma-separated proxy list used by yt-dlp (rotated per request).
+# Helps avoid YouTube bot-detection / login prompts. Empty = no proxy.
+# Example: "socks5://127.0.0.1:9050,http://user:pass@host:port"
+YTDLP_PROXIES: list[str] = [
+    p.strip() for p in os.getenv("YTDLP_PROXIES", "").split(",") if p.strip()
+]
+
+# Optional cookies file for yt-dlp (e.g. a cookies.txt exported from your browser).
+# Resolves YouTube "Sign in to confirm you're not a bot" issues.
+YTDLP_COOKIES: str = os.getenv("YTDLP_COOKIES", "").strip()
+
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,9 +28,14 @@ def humanbytes(size: int) -> str:
 
 def _command_base(parsed_input, settings) -> list[str]:
     command = ["yt-dlp", "--no-warnings"]
-    proxy = getattr(settings, "http_proxy", "")
-    if proxy:
-        command.extend(["--proxy", proxy])
+    proxies = getattr(settings, "ytdlp_proxies", []) or []
+    if proxies:
+        command.extend(["--proxy", random.choice(proxies)])
+    elif getattr(settings, "http_proxy", ""):
+        command.extend(["--proxy", settings.http_proxy])
+    cookies = getattr(settings, "ytdlp_cookies", "")
+    if cookies and Path(cookies).is_file():
+        command.extend(["--cookies", cookies])
     if parsed_input.username:
         command.extend(["--username", parsed_input.username])
     if parsed_input.password:

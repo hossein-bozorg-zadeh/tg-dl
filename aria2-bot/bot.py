@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import inspect
 import logging
 import os
 import re
@@ -10,7 +11,7 @@ import time
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ButtonStyle, ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
@@ -59,6 +60,9 @@ def bar(pct: float, width: int = 16) -> str:
 
 
 def btn(text: str, callback_data: str, style: str = "primary") -> InlineKeyboardButton:
+    # Telegram only supports danger/success/primary; secondary == default look.
+    if style == "secondary":
+        style = "primary"
     return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
 
 
@@ -71,22 +75,28 @@ def allowed(user_id: int) -> bool:
 
 
 def guard(func):
+    sig = inspect.signature(func)
+
     async def wrapper(message: Message, *args, **kwargs):
         if message.from_user and not allowed(message.from_user.id):
             logger.warning("Denied access for user %s", message.from_user.id)
             await message.answer("⛔ You don't have access to this bot.")
             return
-        return await func(message, *args, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return await func(message, *args, **accepted)
 
     return wrapper
 
 
 def guard_owner(func):
+    sig = inspect.signature(func)
+
     async def wrapper(message: Message, *args, **kwargs):
         if message.from_user and not is_owner(message.from_user.id):
             await message.answer("⛔ Owner only.")
             return
-        return await func(message, *args, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return await func(message, *args, **accepted)
 
     return wrapper
 
@@ -259,10 +269,91 @@ async def on_menu_cb(cb: CallbackQuery, state: FSMContext):
         name = cb.from_user.first_name if cb.from_user else "there"
         await cb.message.edit_text(welcome_text(name), reply_markup=main_menu())
         return
-    if action in ("dl", "list", "pause", "resume", "cancel"):
-        await cb.answer(f"Use the /{action} command.", show_alert=True)
+    if action == "dl":
+        await cb.answer()
+        await cb.message.edit_text(
+            "📥 <b>Send me a link</b> to download.\n\n"
+            "Formats:\n"
+            "<code>URL</code> · <code>URL|filename.ext</code>\n"
+            "<code>URL|name.ext|user|pass</code> · <code>URL * name.ext</code>\n\n"
+            "You can also use <code>/dl URL</code>.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]]),
+        )
+        return
+    if action in ("list", "pause", "resume", "cancel"):
+        await cb.answer()
+        await show_downloads(cb.message, action)
         return
     await cb.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("dlact:"))
+async def on_dlact_cb(cb: CallbackQuery):
+    parts = cb.data.split(":")
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    _, action, gid = parts
+    try:
+        if action == "pause":
+            await aria2.pause(gid)
+            await cb.answer("⏸️ Paused")
+        elif action == "resume":
+            await aria2.unpause(gid)
+            await cb.answer("▶️ Resumed")
+        elif action == "cancel":
+            await aria2.remove(gid)
+            await aria2.remove_result(gid)
+            await cb.answer("🗑️ Removed")
+        else:
+            await cb.answer()
+            return
+    except RuntimeError as e:
+        await cb.answer(f"❌ {e}", show_alert=True)
+        return
+    await show_downloads(cb.message, "list")
+
+
+async def show_downloads(message: Message, action: str):
+    """Render the download list for menu actions. Each download gets an action button."""
+    try:
+        items = await aria2.all_status()
+    except RuntimeError as e:
+        try:
+            await message.edit_text(f"❌ aria2 RPC error: {e}")
+        except Exception:
+            pass
+        return
+    if not items:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]])
+        try:
+            await message.edit_text("📭 No downloads.", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    from aria2_client import Aria2Client
+    text = "\n\n".join(Aria2Client.format_status(it) for it in items[:6])
+    rows = []
+    for it in items[:6]:
+        gid = it.get("gid")
+        if not gid:
+            continue
+        label = f"🆔 {gid[:8]}"
+        if action == "list":
+            rows.append([btn(label, f"dlact:nothing:{gid}", "primary")])
+        elif action == "pause":
+            rows.append([btn(f"⏸️ {gid[:8]}", f"dlact:pause:{gid}", "danger")])
+        elif action == "resume":
+            rows.append([btn(f"▶️ {gid[:8]}", f"dlact:resume:{gid}", "success")])
+        elif action == "cancel":
+            rows.append([btn(f"🗑️ {gid[:8]}", f"dlact:cancel:{gid}", "danger")])
+    rows.append([btn("🏠 Back", "menu:home", "secondary")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await message.edit_text(f"<pre>{text}</pre>", reply_markup=kb)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -312,7 +403,7 @@ def _filter_link_parts(parts: list[str]) -> list[str]:
     return [p for p in parts if p.startswith(("http://", "https://", "ftp://", "magnet:?"))]
 
 
-@dp.message(F.text)
+@dp.message(F.text, StateFilter(None))
 @guard
 async def handle_text(message: Message):
     text = (message.text or "").strip()
@@ -715,6 +806,16 @@ async def resend_cached(cached: dict, chat_id: int) -> bool:
         return False
 
 
+def _msg_id(msg) -> int:
+    """Normalize message id from either an aiogram Message (.message_id) or Telethon (.id)."""
+    if msg is None:
+        return 0
+    mid = getattr(msg, "message_id", None)
+    if mid is None:
+        mid = getattr(msg, "id", 0)
+    return int(mid)
+
+
 async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg: Message):
     path = artifact["path"]
     name = artifact["file_name"]
@@ -744,14 +845,16 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
             )
             return
 
+    upload_cb = _upload_progress_cb(status_msg, name)
+
     # Step 1: store in channel (cache) + log
     stored_parts: list[dict] = []
     if config.CHANNEL_ID:
         for part_path in parts:
             part_name = os.path.basename(part_path) if len(parts) > 1 else name
             try:
-                chan_msg = await upload_to_channel(part_path, part_name)
-                stored_parts.append({"name": part_name, "msg_id": chan_msg.message_id})
+                chan_msg_id = await upload_to_channel(part_path, part_name, progress_cb=upload_cb)
+                stored_parts.append({"name": part_name, "msg_id": chan_msg_id})
             except Exception as e:
                 logger.error("channel upload failed: %s", e)
         if stored_parts:
@@ -772,14 +875,38 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
         part_name = os.path.basename(part_path) if len(parts) > 1 else name
         part_send_type = "document" if len(parts) > 1 else send_type
         part_caption = f"{caption} (part {i + 1}/{len(parts)})" if len(parts) > 1 else caption
-        await send_media(chat_id, part_path, part_name, part_send_type, part_caption, thumb, status_msg)
+        await send_media(chat_id, part_path, part_name, part_send_type, part_caption, thumb, status_msg, progress_cb=upload_cb)
     try:
         await status_msg.delete()
     except Exception:
         pass
 
 
-async def send_media(chat_id: int, path: str, name: str, send_type: str, caption: str, thumb: str | None, status_msg: Message):
+def _upload_progress_cb(status_msg: Message, name: str):
+    last = {"t": 0, "pct": -1}
+
+    async def cb(done: int, total: int, speed: int = 0):
+        now = time.time()
+        if now - last["t"] < 1.0:
+            return
+        last["t"] = now
+        pct = (done / total * 100) if total > 0 else 0
+        if pct - last["pct"] < 0.8:
+            return
+        last["pct"] = pct
+        try:
+            await status_msg.edit_text(
+                f"⬆️ <b>Uploading {name}</b>\n<code>{bar(pct)}</code> {pct:.1f}%\n"
+                f"📦 {_fmt_size(done)} / {_fmt_size(total)}"
+                + (f"\n⚡ {_fmt_speed(speed)}" if speed else "")
+            )
+        except Exception:
+            pass
+
+    return cb
+
+
+async def send_media(chat_id: int, path: str, name: str, send_type: str, caption: str, thumb: str | None, status_msg: Message, progress_cb=None):
     size = os.path.getsize(path)
     thumb_input = FSInputFile(thumb) if thumb and os.path.isfile(thumb) else None
 
@@ -803,6 +930,7 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
             attributes=[DocumentAttributeFilename(file_name=name)],
             part_size_kib=1024,
             file_size=size,
+            progress_callback=progress_cb,
         )
         return
 
@@ -812,19 +940,22 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
     )
 
 
-async def upload_to_channel(path: str, name: str) -> Message:
+async def upload_to_channel(path: str, name: str, progress_cb=None) -> int:
     size = os.path.getsize(path)
     if size <= config.MAX_BOTAPI_SIZE:
         with open(path, "rb") as fh:
-            return await bot.send_document(config.CHANNEL_ID, BufferedInputFile(fh.read(), filename=name))
+            msg = await bot.send_document(config.CHANNEL_ID, BufferedInputFile(fh.read(), filename=name))
+            return _msg_id(msg)
     if mtproto is not None:
-        return await mtproto.send_file(
+        msg = await mtproto.send_file(
             config.CHANNEL_ID,
             path,
             attributes=[DocumentAttributeFilename(file_name=name)],
             part_size_kib=1024,
             file_size=size,
+            progress_callback=progress_cb,
         )
+        return _msg_id(msg)
     raise RuntimeError(f"File {name} is {_fmt_size(size)}, larger than Bot API limit, and MTProto is not configured")
 
 
@@ -946,7 +1077,12 @@ async def on_admin_cb(cb: CallbackQuery, state: FSMContext):
     if action == "add":
         await cb.answer()
         await state.set_state(AdminState.add_user)
-        await cb.message.edit_text("Send me the user's Telegram numeric ID to grant access.\n(e.g. <code>123456789</code>)")
+        await cb.message.edit_text(
+            "Send the Telegram numeric ID(s) to grant access.\n"
+            "You can send several at once — separated by spaces, commas or newlines.\n"
+            "(e.g. <code>123456789 987654321 555111222</code>)\n"
+            "Send /cancel to abort."
+        )
     elif action == "remove":
         await cb.answer()
         admins = db.get_admins()
@@ -980,18 +1116,34 @@ async def on_del_cb(cb: CallbackQuery):
 @dp.message(AdminState.add_user)
 @guard_owner
 async def admin_add_user(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit():
-        await message.answer("❌ That doesn't look like a numeric user ID. Try again or send /cancel.")
+    text = (message.text or "").strip()
+    ids = re.split(r"[\s,;]+", text)
+    ids = [i for i in ids if i.isdigit()]
+    if not ids:
+        await message.answer(
+            "❌ That doesn't look like numeric user IDs.\n"
+            "Send one or more IDs separated by spaces/commas/newlines.\n"
+            "Example: <code>123456 789012 345678</code>\n"
+            "Or send /cancel."
+        )
         return
-    uid = int(text)
-    db.add_admin(uid)
+    added = []
+    for i in ids:
+        uid = int(i)
+        if uid in db.get_admins() or uid == config.OWNER_ID:
+            continue
+        db.add_admin(uid)
+        added.append(uid)
+        try:
+            await bot.send_message(uid, "🎉 You now have access to the downloader bot. Send /start to begin.")
+        except Exception as e:
+            logger.warning("could not notify new user %s: %s", uid, e)
     await state.clear()
-    await message.answer(f"✅ User <code>{uid}</code> now has access.")
-    try:
-        await bot.send_message(uid, "🎉 You now have access to the downloader bot. Send /start to begin.")
-    except Exception as e:
-        logger.warning("could not notify new user %s: %s", uid, e)
+    if not added:
+        await message.answer("⚠️ All provided IDs already have access.")
+        return
+    names = " ".join(f"<code>{u}</code>" for u in added)
+    await message.answer(f"✅ Granted access to {len(added)} user(s):\n{names}")
 
 
 # --------------------------------------------------------------------------
