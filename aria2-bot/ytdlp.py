@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from urllib.parse import urlparse
+
+logger = logging.getLogger("aria2bot.ytdlp")
+
+VIDEO_EXTENSIONS = {"mp4", "mkv", "webm", "mov", "avi", "flv"}
+AUDIO_EXTENSIONS = {"mp3", "m4a", "aac", "wav", "flac", "opus", "weba"}
+
+MIB = 1024 * 1024
+
+
+def humanbytes(size: int) -> str:
+    size = float(size or 0)
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024 * 1024):.2f} GiB"
+    if size >= MIB:
+        return f"{size / MIB:.2f} MiB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size:.0f} B"
+
+
+def _command_base(parsed_input, settings) -> list[str]:
+    command = ["yt-dlp", "--no-warnings"]
+    proxy = getattr(settings, "http_proxy", "")
+    if proxy:
+        command.extend(["--proxy", proxy])
+    if parsed_input.username:
+        command.extend(["--username", parsed_input.username])
+    if parsed_input.password:
+        command.extend(["--password", parsed_input.password])
+    return command
+
+
+async def _run_command(command: list[str], cwd: Path | None = None) -> tuple[str, str]:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(cwd) if cwd else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        error_text = stderr.decode().strip() or stdout.decode().strip() or "yt-dlp failed"
+        raise RuntimeError(error_text)
+    return stdout.decode().strip(), stderr.decode().strip()
+
+
+async def _run_command_with_progress(command: list[str], cwd: Path | None, progress_cb=None) -> None:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(cwd) if cwd else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    last_pct = -1
+    error_lines: list[str] = []
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        text = line.decode(errors="replace").strip()
+        if not text:
+            continue
+        if text.startswith("ERROR"):
+            error_lines.append(text)
+        # Skip informational lines (they start with "[" or contain no percent).
+        if text.startswith("[") or "%|" not in text:
+            continue
+        # yt-dlp --newline --progress-template output like: " 45.6%| 2.1MiB/s"
+        try:
+            pct_str = text.split("%")[0].strip()
+            pct = float(pct_str)
+            speed = text.split("|")[1].strip() if "|" in text else ""
+            if pct - last_pct >= 0.5:
+                last_pct = pct
+                if progress_cb:
+                    await progress_cb(pct, speed)
+        except (ValueError, IndexError):
+            continue
+    code = await process.wait()
+    if code != 0:
+        detail = " | ".join(error_lines[-3:]) if error_lines else f"exit code {code}"
+        raise RuntimeError(f"yt-dlp failed: {detail}")
+
+
+def _is_audio_only(format_note: str | None) -> bool:
+    return bool(format_note and "audio only" in format_note.lower())
+
+
+def _label_for_format(format_data: dict, index: int) -> str:
+    format_note = format_data.get("format_note") or format_data.get("format") or f"Format {index + 1}"
+    size = format_data.get("filesize") or format_data.get("filesize_approx") or 0
+    ext = format_data.get("ext", "")
+    return f"Video {format_note} {ext} {humanbytes(size)}".strip()
+
+
+def _ext_from_url(url: str) -> str | None:
+    suffix = Path(urlparse(url).path).suffix
+    return suffix.lstrip(".") if suffix else None
+
+
+def _option_id(prefix: str, index: int) -> str:
+    return f"{prefix}{index}"
+
+
+async def probe_url(parsed_input, settings) -> dict:
+    command = _command_base(parsed_input, settings)
+    command.extend(["--dump-single-json", parsed_input.source_url])
+    stdout, _ = await _run_command(command)
+    if "\n" in stdout:
+        stdout = stdout.splitlines()[0]
+    return json.loads(stdout)
+
+
+def build_quick_youtube_options() -> list[dict]:
+    return [
+        {"option_id": "quick_audio", "label": "🎵 Audio (MP3)", "send_type": "audio", "mode": "youtube_quick"},
+        {"option_id": "quick_video", "label": "🎬 Video (MP4)", "send_type": "video", "mode": "youtube_quick"},
+    ]
+
+
+def build_ytdlp_options(info: dict) -> list[dict]:
+    options: list[dict] = []
+    formats = info.get("formats") or []
+    for index, format_data in enumerate(formats):
+        format_note = format_data.get("format_note") or format_data.get("format")
+        if format_note and "dash" in format_note.lower():
+            continue
+        if _is_audio_only(format_note):
+            continue
+        ext = format_data.get("ext")
+        format_id = format_data.get("format_id")
+        if not ext or not format_id:
+            continue
+        options.append(
+            {
+                "option_id": _option_id("fmt", len(options)),
+                "label": _label_for_format(format_data, index),
+                "send_type": "video",
+                "mode": "ytdlp_format",
+                "format_id": str(format_id),
+                "file_ext": ext,
+            }
+        )
+    if info.get("duration"):
+        for quality in ("64k", "128k", "320k"):
+            options.append(
+                {
+                    "option_id": _option_id("audio", len(options)),
+                    "label": f"🎵 MP3 ({quality})",
+                    "send_type": "audio",
+                    "mode": "ytdlp_audio",
+                    "file_ext": "mp3",
+                    "audio_quality": quality,
+                }
+            )
+    return options
+
+
+def build_direct_options(parsed_input, info: dict | None = None) -> list[dict]:
+    ext = None
+    source_url = parsed_input.source_url
+    if info:
+        ext = info.get("ext")
+    if not ext:
+        ext = _ext_from_url(source_url)
+    send_type = "document"
+    if ext and ext.lower() in VIDEO_EXTENSIONS:
+        send_type = "video"
+    elif ext and ext.lower() in AUDIO_EXTENSIONS:
+        send_type = "audio"
+    options = [
+        {
+            "option_id": "direct_primary",
+            "label": "Send as media" if send_type != "document" else "Send as document",
+            "send_type": send_type,
+            "mode": "direct",
+            "file_ext": ext,
+        }
+    ]
+    if send_type != "document":
+        options.append(
+            {
+                "option_id": "direct_document",
+                "label": "Send as document",
+                "send_type": "document",
+                "mode": "direct",
+                "file_ext": ext,
+            }
+        )
+    return options
+
+
+def _pick_downloaded_file(work_dir: Path) -> Path:
+    files = [
+        path
+        for path in work_dir.rglob("*")
+        if path.is_file()
+        and not path.name.endswith(".part")
+        and path.suffix.lower() not in {".json", ".jpg", ".jpeg", ".png", ".webp"}
+    ]
+    if not files:
+        raise RuntimeError("No file was downloaded")
+    files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return files[0]
+
+
+def _caption_from_info(info: dict, fallback: str) -> str:
+    title = info.get("title")
+    webpage = info.get("webpage_url")
+    if title and webpage:
+        return f'<b><a href="{webpage}">{title}</a></b>'
+    return title or fallback
+
+
+async def download_quick_youtube(parsed_input, option: dict, settings, work_dir: Path, progress_cb=None) -> dict:
+    info = await probe_url(parsed_input, settings)
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    command = _command_base(parsed_input, settings)
+    command.extend(["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"])
+    output_template = str(work_dir / "%(title)s [%(id)s].%(ext)s")
+    if option.get("option_id") == "quick_audio":
+        command.extend(
+            ["-f", "bestaudio", "--extract-audio", "--audio-format", "mp3", "-o", output_template, parsed_input.source_url]
+        )
+        send_type = "audio"
+    else:
+        command.extend(["-f", "best[ext=mp4]/best", "-o", output_template, parsed_input.source_url])
+        send_type = "video"
+    await _run_command_with_progress(command, cwd=work_dir, progress_cb=progress_cb)
+    file_path = _pick_downloaded_file(work_dir)
+    return {
+        "path": file_path,
+        "file_name": file_path.name,
+        "send_type": send_type,
+        "caption": _caption_from_info(info, file_path.stem),
+    }
+
+
+async def download_selected_format(parsed_input, option: dict, info: dict, settings, work_dir: Path, progress_cb=None) -> dict:
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    command = _command_base(parsed_input, settings)
+    command.extend(["--newline", "--progress-template", "%(progress._percent_str)s|%(progress._speed_str)s"])
+    output_template = str(work_dir / "%(title)s [%(id)s].%(ext)s")
+    if option.get("mode") == "ytdlp_audio":
+        command.extend(
+            [
+                "--extract-audio",
+                "--audio-format",
+                option.get("file_ext") or "mp3",
+                "--audio-quality",
+                option.get("audio_quality") or "128k",
+                "-o",
+                output_template,
+                parsed_input.source_url,
+            ]
+        )
+        send_type = "audio"
+    else:
+        format_selector = option.get("format_id") or "best"
+        if "youtube" in parsed_input.source_url or "youtu.be" in parsed_input.source_url:
+            format_selector = f"{format_selector}+bestaudio"
+        command.extend(["-f", format_selector, "--embed-subs", "-o", output_template, parsed_input.source_url])
+        send_type = option.get("send_type", "video")
+    await _run_command_with_progress(command, cwd=work_dir, progress_cb=progress_cb)
+    file_path = _pick_downloaded_file(work_dir)
+    return {
+        "path": file_path,
+        "file_name": file_path.name,
+        "send_type": send_type,
+        "caption": _caption_from_info(info, file_path.stem),
+    }

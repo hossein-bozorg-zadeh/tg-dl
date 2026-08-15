@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+.env
+
+# runtime state
+bot_data.json
+requests.json
+mtproto_session*
+session.txt
+
+# downloads & temp
+downloads/
+*.log
