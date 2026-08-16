@@ -23,6 +23,7 @@ import config
 import db
 import dlapi
 import downloaders
+import koutube
 import media
 import parsing
 import store
@@ -513,7 +514,19 @@ async def process_link(message: Message, raw_text: str):
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
-        # Try dlapi service first: gives direct links, bypasses bot-detection.
+        # 1) Koutube first (if configured): direct links via Invidious,
+        #    completely bypasses YouTube bot-detection.
+        if config.KOUTUBE_BASE_URL:
+            try:
+                koutube_options = await koutube.build_options(config.KOUTUBE_BASE_URL, url)
+            except Exception as e:
+                logger.info("koutube failed, continuing: %s", e)
+                koutube_options = []
+            if koutube_options:
+                token = store.create_request("ytdlp_selection", parsed, koutube_options, {})
+                await message.answer("🎥 <b>YouTube detected</b> — pick a quality/format:", reply_markup=format_kb(token))
+                return
+        # 2) Try dlapi service next: gives direct links, bypasses bot-detection.
         dlapi_data = await dlapi.fetch_youtube(url)
         dlapi_options = dlapi.build_options(dlapi_data) if dlapi_data else []
         if dlapi_options:
