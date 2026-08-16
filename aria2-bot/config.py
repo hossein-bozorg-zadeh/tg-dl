@@ -1,4 +1,6 @@
+import json
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -11,6 +13,91 @@ ARIA2_SECRET: str = os.getenv("ARIA2_SECRET", "aria2botsecret")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", os.path.join(BASE_DIR, "downloads"))
+
+# proxies.json uploaded to the bot (owner-only) takes priority over YTDLP_PROXIES env.
+PROXIES_JSON: str = os.getenv("PROXIES_JSON", os.path.join(BASE_DIR, "proxies.json"))
+
+
+def _normalize_proxy_string(value: str) -> str:
+    """Coerce a raw proxy string into a yt-dlp-friendly URL."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        return value
+    # "user:pass@ip:port" -> http://user:pass@ip:port
+    # "ip:port" -> http://ip:port
+    return f"http://{value}"
+
+
+def _proxy_from_dict(item: dict) -> str:
+    """Extract a proxy URL from a dict, covering common JSON formats."""
+    url = item.get("url") or item.get("proxy") or item.get("proxy_url") or item.get("address")
+    if isinstance(url, str) and url.strip():
+        return _normalize_proxy_string(url)
+    host = item.get("ip") or item.get("host") or item.get("hostname") or item.get("server") or item.get("addr")
+    port = item.get("port")
+    if not host or port is None:
+        return ""
+    protocol = str(item.get("protocol") or item.get("scheme") or item.get("type") or "http").lower()
+    auth = ""
+    user = item.get("username") or item.get("user") or item.get("login") or item.get("auth_user")
+    password = item.get("password") or item.get("pass") or item.get("pwd") or item.get("auth_pass")
+    if user:
+        auth = f"{user}:{password or ''}@"
+    return f"{protocol}://{auth}{host}:{port}"
+
+
+def extract_proxy_list(raw) -> list[str]:
+    """Parse a proxies JSON document into a list of proxy URLs.
+    Accepts arrays, objects, or nested containers with many field names."""
+    proxies: list[str] = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key in ("proxies", "proxy", "proxy_list", "items", "data", "list", "result", "servers"):
+                child = node.get(key)
+                if child is not None:
+                    walk(child)
+            if not any(k in node for k in ("proxies", "proxy", "proxy_list", "items", "data", "list", "result", "servers")):
+                url = _proxy_from_dict(node)
+                if url:
+                    proxies.append(url)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+        elif isinstance(node, str):
+            url = _normalize_proxy_string(node)
+            if url:
+                proxies.append(url)
+
+    walk(raw)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def load_proxies() -> list[str]:
+    proxies: list[str] = [
+        p.strip() for p in os.getenv("YTDLP_PROXIES", "").split(",") if p.strip()
+    ]
+    try:
+        with open(PROXIES_JSON, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        proxies.extend(extract_proxy_list(raw))
+    except (OSError, ValueError):
+        pass
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
 
 # Owner: can manage admins, always allowed.
 OWNER_ID: int = int(os.getenv("OWNER_ID", "0") or 0)
@@ -47,9 +134,8 @@ HTTP_PROXY: str = os.getenv("HTTP_PROXY", "").strip()
 # Comma-separated proxy list used by yt-dlp (rotated per request).
 # Helps avoid YouTube bot-detection / login prompts. Empty = no proxy.
 # Example: "socks5://127.0.0.1:9050,http://user:pass@host:port"
-YTDLP_PROXIES: list[str] = [
-    p.strip() for p in os.getenv("YTDLP_PROXIES", "").split(",") if p.strip()
-]
+# A proxies.json file uploaded to the bot overrides these.
+YTDLP_PROXIES: list[str] = load_proxies()
 
 # Optional cookies file for yt-dlp (e.g. a cookies.txt exported from your browser).
 # Resolves YouTube "Sign in to confirm you're not a bot" issues.

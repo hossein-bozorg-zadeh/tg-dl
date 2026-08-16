@@ -29,6 +29,11 @@ def humanbytes(size: int) -> str:
 def _command_base(parsed_input, settings, use_cookies: bool = True) -> list[str]:
     command = ["yt-dlp", "--no-warnings"]
     proxies = getattr(settings, "YTDLP_PROXIES", None) or []
+    if not proxies and hasattr(settings, "load_proxies"):
+        try:
+            proxies = settings.load_proxies()
+        except Exception:
+            proxies = []
     if proxies:
         command.extend(["--proxy", random.choice(proxies)])
     elif getattr(settings, "HTTP_PROXY", ""):

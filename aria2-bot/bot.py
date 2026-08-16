@@ -423,6 +423,29 @@ async def handle_text(message: Message):
 @dp.message(F.document | F.video_note)
 @guard
 async def handle_torrent_file(message: Message):
+    if message.document and message.document.file_name and message.document.file_name.lower() == "proxies.json":
+        if not is_owner(message.from_user.id):
+            await message.answer("❌ Only the owner can update the proxy list.")
+            return
+        buf = await bot.download(message.document)
+        data = buf.getvalue() if hasattr(buf, "getvalue") else buf
+        try:
+            import json
+            raw = json.loads(data.decode("utf-8"))
+        except Exception:
+            await message.answer("❌ Invalid JSON. Send an array like [\"http://ip:port\", ...] or {\"proxies\": [...]}.")
+            return
+        parsed = config.extract_proxy_list(raw)
+        if not parsed:
+            await message.answer("❌ No proxies found in the JSON.")
+            return
+        with open(config.PROXIES_JSON, "w", encoding="utf-8") as f:
+            json.dump(parsed, f, indent=2)
+        config.YTDLP_PROXIES = parsed
+        sample = "\n".join(f"<code>{p}</code>" for p in parsed[:5])
+        more = f"\n… and {len(parsed) - 5} more" if len(parsed) > 5 else ""
+        await message.answer(f"✅ Proxy list updated: <b>{len(parsed)}</b> proxies. yt-dlp will rotate them per request.\n{sample}{more}")
+        return
     if message.document and message.document.file_name and message.document.file_name.lower() == "cookies.txt":
         if not is_owner(message.from_user.id):
             await message.answer("❌ Only the owner can update the cookies file.")
