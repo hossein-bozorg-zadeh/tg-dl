@@ -21,6 +21,7 @@ from telethon.tl.types import DocumentAttributeFilename
 
 import config
 import db
+import dlapi
 import downloaders
 import media
 import parsing
@@ -512,6 +513,14 @@ async def process_link(message: Message, raw_text: str):
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
+        # Try dlapi service first: gives direct links, bypasses bot-detection.
+        dlapi_data = await dlapi.fetch_youtube(url)
+        dlapi_options = dlapi.build_options(dlapi_data) if dlapi_data else []
+        if dlapi_options:
+            token = store.create_request("ytdlp_selection", parsed, dlapi_options, dlapi_data)
+            await message.answer("🎥 <b>YouTube detected</b> — pick a quality/format:", reply_markup=format_kb(token))
+            return
+        # Fall back to yt-dlp probe (with cookies/proxy retry logic).
         try:
             info = await ytdlp.probe_url(parsed, config)
             options = ytdlp.build_youtube_quality_options(info)
@@ -619,6 +628,8 @@ async def on_request_cb(cb: CallbackQuery):
             artifact = await mediafire_download(parsed, option, config, work_dir, status_msg=status_msg)
         elif rec["request_type"] == "direct_download":
             artifact = await direct_download(parsed, option, config, work_dir, info=rec.get("info") or None, status_msg=status_msg)
+        elif option.get("mode") == "dlapi_download":
+            artifact = await dlapi_download(parsed, option, config, work_dir, status_msg=status_msg)
         else:
             artifact = await ytdlp.download_selected_format(parsed, option, rec.get("info") or {}, config, work_dir, progress_cb=_progress_cb(status_msg))
 
@@ -724,6 +735,51 @@ async def direct_download(parsed, option, settings, work_dir, info=None, status_
         raise RuntimeError("No file after download")
     path = files[0]
     return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": parsed.custom_file_name or os.path.basename(path)}
+
+
+async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
+    """Download a direct URL obtained from the dlapi service via aria2."""
+    url = option.get("url") or parsed.source_url
+    ext = option.get("file_ext")
+    out_name = parsed.custom_file_name or ""
+    if not out_name:
+        out_name = f"dlapi_download.{ext}" if ext else "dlapi_download.mp4"
+    out_name = clean_filename(out_name)
+    if ext and not out_name.lower().endswith(f".{ext.lower()}"):
+        out_name = f"{out_name}.{ext}"
+
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    opts = {"dir": str(work_dir), "out": out_name}
+    gid = await aria2.add_uri([url], opts)
+
+    async def progress_cb(done, total, speed):
+        if not status_msg:
+            return
+        pct = (done / total * 100) if total > 0 else 0
+        try:
+            await status_msg.edit_text(
+                f"📥 <b>Downloading {out_name}</b>\n<code>{bar(pct)}</code> {pct:.1f}%\n"
+                f"📦 {_fmt_size(done)} / {_fmt_size(total)}\n⚡ {_fmt_speed(speed)}"
+            )
+        except Exception:
+            pass
+
+    st = await downloaders.wait_aria2(aria2, gid, progress_cb)
+    if st.get("status") != "complete":
+        raise RuntimeError(st.get("errorMessage", "download failed"))
+    path = os.path.join(work_dir, out_name)
+    if not os.path.exists(path):
+        files = [f.get("path") for f in (st.get("files") or []) if f.get("path") and os.path.exists(f.get("path"))]
+        path = files[0] if files else None
+        if not path:
+            raise RuntimeError("No file after download")
+    send_type = option.get("send_type", "document")
+    if ext and ext.lower() in ("mp3", "m4a", "aac", "wav", "flac", "opus", "weba"):
+        send_type = "audio"
+    elif ext and ext.lower() in ("mp4", "mkv", "webm", "mov", "avi", "flv"):
+        send_type = "video"
+    return {"path": path, "file_name": os.path.basename(path), "send_type": send_type, "caption": parsed.custom_file_name or os.path.basename(path)}
 
 
 async def mega_download(parsed, option, settings, work_dir, status_msg=None):
