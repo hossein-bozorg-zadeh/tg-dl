@@ -14,7 +14,7 @@ Send any link (or a `.torrent` file) to the bot and it downloads the file on the
   - YouTube — quality/format selection menu (1080p/720p/... + MP3)
   - 1000+ sites supported by yt-dlp (Twitch, Vimeo, TikTok, Instagram, ...)
 - **Quality & format picker** — when a source exposes multiple formats, the bot shows a button menu to choose from
-- **YouTube bot-detection workarounds** — cookies file, rotating proxy list, and a server-side download API fallback (dlapi) so your server's IP doesn't get blocked
+- **YouTube bot-detection workarounds** — self-hosted Koutube instance (direct links via Invidious), cookies file, rotating proxy list, and a server-side download API fallback (dlapi) so your server's IP doesn't get blocked
 - **Live progress bars** — download and upload progress are shown in an in-place edited message
 - **Uploads up to 2 GiB** via MTProto (Telethon); files larger than 2 GiB are **split** into parts < 1.5 GiB
 - **Private-channel storage** — every file is uploaded to the owner's private channel and indexed
@@ -36,6 +36,7 @@ Telegram user <-> Bot (aiogram + Telethon) <-> aria2 RPC (port 6800) <-> interne
 - **aiogram** handles Telegram Bot API messages and inline buttons.
 - **Telethon** (MTProto) handles large file uploads (> 49 MiB up to 2 GiB).
 - **yt-dlp** probes and downloads media sites; **megatools** handles Mega; **ffmpeg** muxes/transcodes when needed.
+- **Koutube** (optional, self-hosted) proxies YouTube through Invidious and returns direct download links, completely avoiding YouTube bot-detection.
 
 ## Project layout
 
@@ -47,6 +48,7 @@ aria2-bot/
 ├── downloaders.py     # URL detection + mega/mediafire/aria2 download helpers
 ├── parsing.py         # link format parsing (URL|name|user|pass, URL * name)
 ├── ytdlp.py           # yt-dlp probe, download, format/quality builders, proxy+cookie handling
+├── koutube.py         # client for a Koutube instance (direct YouTube links via Invidious)
 ├── dlapi.py           # client for dlapi.yebekhe.workers.dev (server-side download fallback)
 ├── media.py           # video/audio metadata (hachoir)
 ├── db.py              # JSON persistence: admins list + file cache index (7-day TTL)
@@ -102,7 +104,41 @@ git clone https://github.com/hossein-bozorg-zadeh/tg-dl.git
 cd tg-dl/aria2-bot
 ```
 
-### 4. Configure the bot
+### 4. Run the setup wizard (recommended)
+
+A one-shot interactive wizard walks you through everything: it installs system
+dependencies, creates a virtualenv, prompts for your Telegram settings, writes
+`.env`, patches `aria2.conf`, starts aria2, optionally installs a systemd
+service, and optionally configures a Koutube instance for YouTube downloads.
+
+```bash
+cd tg-dl
+bash setup.sh
+```
+
+It will ask you for:
+
+- `BOT_TOKEN` — from @BotFather
+- `OWNER_ID` — your numeric Telegram ID
+- `CHANNEL_ID` — your private channel (bot must be admin)
+- `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — for >49 MiB uploads
+- `ALLOWED_USERS` — optional extra users (comma-separated)
+- `KOUTUBE_BASE_URL` — enter `public` for the public koutu.be, a self-hosted
+  URL, or leave empty to skip (see the Koutube guide below)
+
+Non-interactive / scripted installs are supported too:
+
+```bash
+BOT_TOKEN=... OWNER_ID=... CHANNEL_ID=... \
+NONINTERACTIVE=1 bash setup.sh
+```
+
+### 5. Manual setup (alternative)
+
+If you prefer to configure things by hand, follow the steps below instead of
+running the wizard.
+
+#### 5.1 Configure the bot
 
 ```bash
 cp .env.example .env
@@ -128,8 +164,9 @@ nano .env
 | `HTTP_PROXY` | Single proxy for yt-dlp / direct downloads (optional) |
 | `YTDLP_PROXIES` | Comma-separated proxy list, rotated per yt-dlp request |
 | `YTDLP_COOKIES` | Path to a `cookies.txt` for YouTube (fixes bot-check) |
+| `KOUTUBE_BASE_URL` | Koutube instance for direct YouTube links (self-hosted or `https://koutu.be`); empty = disabled |
 
-### 5. Fix the aria2 download dir
+### 5.2 Fix the aria2 download dir
 
 Edit `aria2.conf` and make sure `dir=` points to your real download directory:
 
@@ -137,7 +174,7 @@ Edit `aria2.conf` and make sure `dir=` points to your real download directory:
 dir=/path/to/your/downloads
 ```
 
-### 6. Start aria2
+### 5.3 Start aria2
 
 ```bash
 aria2c --conf-path=aria2.conf
@@ -149,7 +186,7 @@ Verify the RPC is up:
 curl http://127.0.0.1:6800/jsonrpc -d '{"jsonrpc":"2.0","id":"1","method":"aria2.getVersion","params":["token:aria2botsecret"]}'
 ```
 
-### 7. Run the bot
+### 5.4 Run the bot
 
 ```bash
 python3 bot.py
@@ -163,7 +200,7 @@ INFO telethon.network.mtprotosender: Connection complete!
 INFO aiogram.dispatcher: Run polling for bot @YourBot
 ```
 
-### 8. Run as a service (recommended)
+### 5.5 Run as a service (recommended)
 
 Create `/etc/systemd/system/tg-dl.service`:
 
@@ -250,7 +287,14 @@ The owner can press **🛠️ Admin** in `/start` to open the panel:
 
 ### Cookies & proxies (YouTube bot-check fixes)
 
-If YouTube shows *"Sign in to confirm you're not a bot"*:
+If YouTube shows *"Sign in to confirm you're not a bot"*, the bot tries these
+in order:
+
+1. **Koutube** (if `KOUTUBE_BASE_URL` is set) — generates direct download links on another server, so your server's IP never talks to YouTube. See the self-hosting guide below.
+2. **dlapi fallback** — `dlapi.yebekhe.workers.dev` (a free server-side downloader). Used automatically when Koutube is disabled or the service is reachable.
+3. **yt-dlp with cookies/proxies** — as a last resort.
+
+You can also help yt-dlp directly:
 
 1. **Upload cookies** — export `cookies.txt` from your logged-in browser ("Get cookies.txt LOCALLY" extension) and send the file to the bot. Only the owner can do this.
 2. **Upload proxies** — name your file `proxies.json` (any `.json`/`.txt`/`.csv` with `prox` in the name also works) and send it to the bot. It accepts almost any format: arrays of strings, JSON objects, plain text (one per line), etc. The bot rotates a random proxy per request.
@@ -267,9 +311,62 @@ If YouTube shows *"Sign in to confirm you're not a bot"*:
    socks5://5.6.7.8:1080
    ```
 
-3. **dlapi fallback** — for YouTube, the bot first tries `dlapi.yebekhe.workers.dev` (a free server-side downloader that returns direct links). This bypasses bot-detection entirely because the download happens on the API's servers, not yours. It's used automatically when the service is reachable.
-
 > Tip: free/datacenter proxies are often flagged by YouTube too. Residential proxies (Bright Data, Oxylabs, Smartproxy, or your own home IP) work best.
+
+### Self-host Koutube (recommended for personal servers)
+
+[Koutube](https://github.com/iGerman00/koutube) is a Cloudflare Workers service
+that returns direct YouTube download links via Invidious. Because the links are
+generated on Cloudflare's servers, **your server's IP is never seen by YouTube**,
+so the "Sign in to confirm you're not a bot" wall disappears entirely.
+
+The bot has a built-in client for any Koutube instance (`koutube.py`). Set
+`KOUTUBE_BASE_URL` in `.env` to point at your instance, and the bot uses it as
+the **primary** YouTube download path.
+
+#### Deploy Koutube to your Cloudflare account
+
+```bash
+# 1. Install wrangler (Cloudflare's CLI) + clone koutube
+npm install -g wrangler
+git clone https://github.com/iGerman00/koutube.git
+cd koutube
+
+# 2. Install dependencies
+npm i
+
+# 3. Create a D1 database in Cloudflare:
+#    https://dash.cloudflare.com -> Workers & Pages -> D1 -> Create database
+#    Copy the database ID, then edit wrangler.toml and replace the
+#    d1_databases.database_id with your own. Example:
+#
+#    [[d1_databases]]
+#    binding = "D1_DB"
+#    database_id = "1234abcd-5678-ef90-1234-5678ef901234"
+#    database_name = "koutube-db"
+
+# 4. Initialize the database and deploy
+npm run init-remote-db
+wrangler deploy
+```
+
+You'll get a URL like `https://koutube.yourdomain.workers.dev`.
+
+> Optional: to get more reliable, un-throttled downloads, host your own private
+> [Invidious](https://docs.invidious.io/installation/) instance and point koutube
+> at it via the `IV_DOMAIN` / `IV_AUTH` secrets (`npx wrangler secret put ...`).
+
+#### Point the bot at it
+
+```bash
+# in aria2-bot/.env
+KOUTUBE_BASE_URL=https://koutube.yourdomain.workers.dev
+```
+
+Or, when using the wizard, enter the URL when asked for `KOUTUBE_BASE_URL`.
+
+> The public instance `https://koutu.be` works too but is rate-limited (10 RPS)
+> and Cloudflare-blocked from some datacenter IPs. Self-hosting is recommended.
 
 ---
 

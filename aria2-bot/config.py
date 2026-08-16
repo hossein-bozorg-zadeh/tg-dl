@@ -211,6 +211,12 @@ YTDLP_PROXIES: list[str] = load_proxies()
 # Resolves YouTube "Sign in to confirm you're not a bot" issues.
 YTDLP_COOKIES: str = os.getenv("YTDLP_COOKIES", "").strip()
 
+# Koutube instance used to get direct YouTube download links.
+# Self-hosted instance recommended for personal servers (Cloudflare Workers + D1).
+# Public instance: https://koutu.be  (rate-limited, use sparingly)
+# Empty = koutube disabled (falls back to dlapi / yt-dlp).
+KOUTUBE_BASE_URL: str = os.getenv("KOUTUBE_BASE_URL", "").strip().rstrip("/")
+
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
 
