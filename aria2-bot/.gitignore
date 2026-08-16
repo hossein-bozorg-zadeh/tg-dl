@@ -3,6 +3,7 @@ __pycache__/
 
 .env
 cookies.txt
+proxies.json
 
 # runtime state
 bot_data.json
