@@ -30,6 +30,17 @@ def _normalize_proxy_string(value: str) -> str:
     return f"http://{value}"
 
 
+def _coerce_string_item(value: str):
+    """If a string is actually a JSON object/array, parse it back."""
+    stripped = value.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            return json.loads(stripped)
+        except ValueError:
+            pass
+    return value
+
+
 def _proxy_from_dict(item: dict) -> str:
     """Extract a proxy URL from a dict, covering common JSON formats."""
     url = item.get("url") or item.get("proxy") or item.get("proxy_url") or item.get("address")
@@ -39,7 +50,11 @@ def _proxy_from_dict(item: dict) -> str:
     port = item.get("port")
     if not host or port is None:
         return ""
-    protocol = str(item.get("protocol") or item.get("scheme") or item.get("type") or "http").lower()
+    protocols = item.get("protocols") or item.get("protocol") or item.get("scheme") or item.get("type")
+    if isinstance(protocols, (list, tuple)):
+        protocol = str(protocols[0] if protocols else "http").lower()
+    else:
+        protocol = str(protocols or "http").lower()
     auth = ""
     user = item.get("username") or item.get("user") or item.get("login") or item.get("auth_user")
     password = item.get("password") or item.get("pass") or item.get("pwd") or item.get("auth_pass")
@@ -67,9 +82,17 @@ def extract_proxy_list(raw) -> list[str]:
             for child in node:
                 walk(child)
         elif isinstance(node, str):
-            url = _normalize_proxy_string(node)
-            if url:
-                proxies.append(url)
+            coerced = _coerce_string_item(node)
+            if isinstance(coerced, dict):
+                url = _proxy_from_dict(coerced)
+                if url:
+                    proxies.append(url)
+            elif isinstance(coerced, list):
+                walk(coerced)
+            else:
+                url = _normalize_proxy_string(node)
+                if url:
+                    proxies.append(url)
 
     walk(raw)
     seen: set[str] = set()
@@ -79,6 +102,53 @@ def extract_proxy_list(raw) -> list[str]:
             seen.add(p)
             unique.append(p)
     return unique
+
+
+def extract_proxies_from_text(text: str) -> list[str]:
+    """Best-effort parse of arbitrary proxy file text (non-JSON).
+    Tries to find JSON objects inline, then falls back to line splitting."""
+    parsed: list[str] = []
+    seen: set[str] = set()
+
+    def add(normalized: str):
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            parsed.append(normalized)
+
+    # 1) Try whole-text JSON (could be wrapped, multi-line, with BOM).
+    cleaned = text.lstrip("\ufeff").strip()
+    try:
+        return extract_proxy_list(json.loads(cleaned))
+    except (ValueError, TypeError):
+        pass
+
+    # 2) Find inline {...} objects (JSON objects embedded in text or broken JSON).
+    for match in re.finditer(r"\{[^{}]*\}", cleaned, flags=re.DOTALL):
+        try:
+            obj_text = match.group(0)
+            obj_text = re.sub(r",\s*([}\]])", r"\1", obj_text)  # drop trailing commas
+            obj = json.loads(obj_text)
+            add(_proxy_from_dict(obj))
+        except (ValueError, TypeError):
+            continue
+    if parsed:
+        return parsed
+
+    # 3) Line / comma / semicolon splitting.
+    for line in re.split(r"[\n;,]+", cleaned):
+        item = line.strip()
+        if not item or item.startswith(("#", "//", "/*")):
+            continue
+        for token in re.split(r"\s+", item):
+            token = token.strip()
+            if not token or token.startswith(("#", "//")):
+                continue
+            if ":" not in token:
+                continue
+            if token.lower() in {"ip:port", "host:port", "proxy:port", "address:port", "addr:port"}:
+                continue
+            add(_normalize_proxy_string(token))
+    return parsed
 
 
 def load_proxies() -> list[str]:

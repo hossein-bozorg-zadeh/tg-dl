@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -423,21 +424,17 @@ async def handle_text(message: Message):
 @dp.message(F.document | F.video_note)
 @guard
 async def handle_torrent_file(message: Message):
-    if message.document and message.document.file_name and message.document.file_name.lower() == "proxies.json":
+    fname = (message.document.file_name or "").lower() if message.document else ""
+    if message.document and ("prox" in fname and fname.endswith((".json", ".txt", ".csv"))):
         if not is_owner(message.from_user.id):
             await message.answer("❌ Only the owner can update the proxy list.")
             return
         buf = await bot.download(message.document)
         data = buf.getvalue() if hasattr(buf, "getvalue") else buf
-        try:
-            import json
-            raw = json.loads(data.decode("utf-8"))
-        except Exception:
-            await message.answer("❌ Invalid JSON. Send an array like [\"http://ip:port\", ...] or {\"proxies\": [...]}.")
-            return
-        parsed = config.extract_proxy_list(raw)
+        text = data.decode("utf-8", errors="replace")
+        parsed = config.extract_proxies_from_text(text)
         if not parsed:
-            await message.answer("❌ No proxies found in the JSON.")
+            await message.answer("❌ Could not find any proxies in the file. Send JSON, plain text (one proxy per line), or CSV.")
             return
         with open(config.PROXIES_JSON, "w", encoding="utf-8") as f:
             json.dump(parsed, f, indent=2)
