@@ -162,7 +162,10 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 env_val() { # $1 = key, reads from existing .env
     local key="$1"
-    [[ -f "${ENV_FILE}" ]] && sed -n "s/^${key}=//p" "${ENV_FILE}" | head -n1
+    if [[ -f "${ENV_FILE}" ]]; then
+        sed -n "s/^${key}=//p" "${ENV_FILE}" | head -n1
+    fi
+    return 0
 }
 
 ask "BOT_TOKEN (from @BotFather)"                 "$(env_val BOT_TOKEN)"
@@ -179,19 +182,64 @@ ask "ALLOWED_USERS (comma-separated, empty=everyone)" "$(env_val ALLOWED_USERS)"
 ALLOWED_USERS="${REPLY}"
 
 # ---------------------------------------------------------------------------
-# 4b. Optional Koutube integration (YouTube direct links, bypasses bot-check)
+# 4b. Optional media-downloader services (bypass YouTube bot-check)
+#
+#   cobalt  — self-hosted via docker compose, tunnels media through its own
+#             server so your IP is never seen by YouTube. Recommended.
+#   koutube — Cloudflare Workers service that returns direct links via
+#             Invidious. Requires a Cloudflare account (deploy manually).
 # ---------------------------------------------------------------------------
-# Prefer a process-env override, then an existing .env value.
+COBALT_API_URL="${COBALT_API_URL:-$(env_val COBALT_API_URL)}"
 KOUTUBE_BASE_URL="${KOUTUBE_BASE_URL:-$(env_val KOUTUBE_BASE_URL)}"
-if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
-    : # KOUTUBE_BASE_URL already resolved above
-else
-    ask "Use Koutube for YouTube? (self-hosted URL, 'public' for koutu.be, empty=skip)" "${KOUTUBE_BASE_URL:-}"
-    if [[ -n "${REPLY}" ]]; then
-        if [[ "${REPLY,,}" == "public" ]]; then
-            KOUTUBE_BASE_URL="https://koutu.be"
-        else
-            KOUTUBE_BASE_URL="${REPLY}"
+
+deploy_cobalt() {
+    step "Deploying cobalt via docker compose"
+    if ! command -v docker >/dev/null 2>&1; then
+        err "docker not found. Install docker first, then re-run this wizard (or set COBALT_API_URL manually)."
+        return 1
+    fi
+    local cobalt_dir="${BOT_DIR}/cobalt"
+    mkdir -p "${cobalt_dir}"
+    cat > "${cobalt_dir}/docker-compose.yml" <<'EOF'
+services:
+    cobalt:
+        image: ghcr.io/imputnet/cobalt:11
+        init: true
+        read_only: true
+        restart: unless-stopped
+        container_name: cobalt
+        ports:
+            - 127.0.0.1:9000:9000/tcp
+        environment:
+            API_URL: "http://127.0.0.1:9000/"
+EOF
+    docker compose -f "${cobalt_dir}/docker-compose.yml" up -d || {
+        docker-compose -f "${cobalt_dir}/docker-compose.yml" up -d
+    }
+    sleep 3
+    COBALT_API_URL="http://127.0.0.1:9000"
+    info "cobalt deployed locally at ${COBALT_API_URL} (config: ${cobalt_dir}/docker-compose.yml)"
+}
+
+if [[ "${NONINTERACTIVE:-0}" != "1" ]]; then
+    ask "Deploy cobalt (self-hosted YouTube downloader, Docker)? [y/N]" ""
+    if [[ "${REPLY,,}" == "y" || "${REPLY,,}" == "yes" ]]; then
+        deploy_cobalt || true
+    fi
+    if [[ -z "${COBALT_API_URL}" ]]; then
+        ask "Cobalt instance URL (empty=skip; e.g. http://127.0.0.1:9000)" ""
+        COBALT_API_URL="${REPLY}"
+    fi
+    if [[ -n "${KOUTUBE_BASE_URL}" && "${KOUTUBE_BASE_URL}" != "public" ]]; then
+        : # keep existing koutube URL
+    else
+        ask "Koutube for YouTube? (self-hosted URL, 'public' for koutu.be, empty=skip)" "${KOUTUBE_BASE_URL:-}"
+        if [[ -n "${REPLY}" ]]; then
+            if [[ "${REPLY,,}" == "public" ]]; then
+                KOUTUBE_BASE_URL="https://koutu.be"
+            else
+                KOUTUBE_BASE_URL="${REPLY}"
+            fi
         fi
     fi
 fi
@@ -259,6 +307,11 @@ YTDLP_COOKIES=
 # Koutube instance for direct YouTube links (self-hosted or public koutu.be).
 # Empty disables koutube (falls back to dlapi / yt-dlp).
 KOUTUBE_BASE_URL=${KOUTUBE_BASE_URL}
+
+# Self-hosted cobalt instance (https://github.com/imputnet/cobalt).
+# Cobalt tunnels media through its own server — YouTube never sees your IP.
+# Empty disables cobalt.
+COBALT_API_URL=${COBALT_API_URL}
 EOF
 chmod 600 "${ENV_FILE}"
 info ".env written"
@@ -357,6 +410,7 @@ ${GREEN}Your bot is configured:${NC}
   Config file:   ${ENV_FILE}
   Download dir:  ${DOWNLOAD_DIR}
   aria2 RPC:     127.0.0.1:6800 (secret: aria2botsecret)
+  Cobalt:        ${COBALT_API_URL:-disabled}
   Koutube:       ${KOUTUBE_BASE_URL:-disabled}
 
 Next steps:
