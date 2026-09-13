@@ -892,7 +892,7 @@ async def on_request_cb(cb: CallbackQuery):
         await cb.answer()
 
 
-async def _progress_cb(status_msg: Message):
+def _progress_cb(status_msg: Message):
     last = {"t": 0}
 
     async def cb(pct: float, speed: str):
