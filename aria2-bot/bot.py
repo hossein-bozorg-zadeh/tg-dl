@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import html
 import inspect
 import json
 import logging
@@ -8,6 +9,9 @@ import os
 import re
 import shutil
 import time
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -34,6 +38,10 @@ from aria2_client import Aria2Client, _fmt_size, _fmt_speed
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(config.BASE_DIR, "bot.log")),
+    ],
 )
 logger = logging.getLogger("aria2bot")
 
@@ -85,12 +93,48 @@ def allowed(user_id: int) -> bool:
     return db.is_allowed(user_id)
 
 
+async def notify_unauthorized(user) -> None:
+    """Tell the owner about a newly seen user who is denied access."""
+    if not config.OWNER_ID or user.id == config.OWNER_ID:
+        return
+    label = html.escape(user.first_name or "Unknown")
+    if user.username:
+        label += f" (@{html.escape(user.username)})"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        btn("✅ Grant access", f"user:grant:{user.id}", "success"),
+        btn("🚫 Ban", f"user:ban:{user.id}", "danger"),
+    ]])
+    try:
+        await bot.send_message(
+            config.OWNER_ID,
+            f"👤 New unauthorized user: <a href=\"tg://user?id={user.id}\">{label}</a>\n"
+            f"ID: <code>{user.id}</code>",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("Could not notify owner about unauthorized user %s", user.id)
+
+
+async def guard_callback(cb: CallbackQuery) -> bool:
+    """Reject callbacks from users who cannot use the bot."""
+    if not cb.from_user or not allowed(cb.from_user.id):
+        await cb.answer("⛔ You don't have access to this bot.", show_alert=True)
+        return False
+    db.record_user(cb.from_user.id, cb.from_user.first_name, cb.from_user.username or "")
+    return True
+
+
 def guard(func):
     sig = inspect.signature(func)
 
     async def wrapper(message: Message, *args, **kwargs):
+        if message.from_user:
+            was_known = db.is_known_user(message.from_user.id)
+            db.record_user(message.from_user.id, message.from_user.first_name, message.from_user.username or "")
         if message.from_user and not allowed(message.from_user.id):
             logger.warning("Denied access for user %s", message.from_user.id)
+            if not was_known:
+                await notify_unauthorized(message.from_user)
             await message.answer("⛔ You don't have access to this bot.")
             return
         accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -103,7 +147,12 @@ def guard_owner(func):
     sig = inspect.signature(func)
 
     async def wrapper(message: Message, *args, **kwargs):
+        if message.from_user:
+            was_known = db.is_known_user(message.from_user.id)
+            db.record_user(message.from_user.id, message.from_user.first_name, message.from_user.username or "")
         if message.from_user and not is_owner(message.from_user.id):
+            if not was_known:
+                await notify_unauthorized(message.from_user)
             await message.answer("⛔ Owner only.")
             return
         accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -141,7 +190,7 @@ def main_menu() -> InlineKeyboardMarkup:
 
 def welcome_text(name: str = "there") -> str:
     return (
-        f"👋 <b>Welcome, {name}!</b>\n\n"
+        f"👋 <b>Welcome, {html.escape(name)}!</b>\n\n"
         "I'm a full download manager running on a Linux server, powered by <b>aria2</b> and <b>yt-dlp</b>.\n\n"
         "📥 <b>What I can download</b>\n"
         "• HTTP/HTTPS/FTP direct links\n"
@@ -163,6 +212,7 @@ def welcome_text(name: str = "there") -> str:
         "/help — all abilities & link formats\n"
         "/about — about this bot\n"
         "/list — show all downloads\n"
+        "/history — show your completed downloads\n"
         "/status &lt;gid&gt; · /pause &lt;gid&gt; · /resume &lt;gid&gt; · /cancel &lt;gid&gt;\n"
         "/thumb · /delthumb — manage your thumbnail\n"
         "/admin — admin panel (owner)\n"
@@ -247,6 +297,167 @@ async def cmd_help(message: Message):
     await message.answer(help_text(), link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
+@dp.message(Command("history"))
+@guard
+async def cmd_history(message: Message):
+    args = (message.text or "").split()
+    if len(args) > 1:
+        await message.answer("❌ Use /history without a user ID. History is private to each user.")
+        return
+    target_id = message.from_user.id
+    entries = db.get_history(target_id, 50)
+    if not entries:
+        await message.answer("📭 No completed downloads yet.")
+        return
+    lines = ["📚 <b>Your download history</b>"]
+    for item in entries:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("timestamp", 0)))
+        lines.append(f"• <b>{html.escape(item.get('name') or 'unnamed')}</b> — {when}")
+    await message.answer("\n".join(lines), reply_markup=history_kb(len(entries)))
+
+
+def history_kb(count: int) -> InlineKeyboardMarkup:
+    rows = [
+        [btn(f"↻ Download #{index + 1}", f"hist:{index}", "primary")]
+        for index in range(count)
+    ]
+    rows.append([btn("🏠 Home", "menu:home", "secondary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("hist:"))
+async def on_history_cb(cb: CallbackQuery):
+    if not await guard_callback(cb):
+        return
+    if not cb.message:
+        await cb.answer()
+        return
+    try:
+        index = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Invalid history item.", show_alert=True)
+        return
+    entries = db.get_history(cb.from_user.id, 50)
+    if index < 0 or index >= len(entries):
+        await cb.answer("That history item is no longer available.", show_alert=True)
+        return
+    item = entries[index]
+    cached = db.find_file(item.get("url", ""))
+    if cached and cached.get("parts") and await resend_cached(cached, cb.message.chat.id):
+        db.add_history(cb.from_user.id, item.get("url", ""), item.get("name", "cached file"), item.get("size", 0), "cached")
+        await cb.answer("Sent from cache.")
+        return
+    await cb.answer("Starting the download again.")
+    await process_link(
+        cb.message,
+        item.get("url", ""),
+        user_id=cb.from_user.id,
+        chat_id=cb.message.chat.id,
+    )
+
+
+def create_backup() -> Path:
+    """Create a backup of persistent bot data without secrets or downloads."""
+    backup_dir = Path(config.BASE_DIR) / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = backup_dir / f"tg-dl-backup-{stamp}.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in ("bot_data.json", "requests.json", "aria2.conf", ".env.example", "bot.log"):
+            source = Path(config.BASE_DIR) / name
+            if source.is_file():
+                archive.write(source, name)
+        thumbnails = Path(config.DOWNLOAD_DIR) / "thumbnails"
+        if thumbnails.is_dir():
+            for source in thumbnails.iterdir():
+                if source.is_file():
+                    archive.write(source, f"thumbnails/{source.name}")
+        archive.writestr(
+            "README.txt",
+            "Persistent tg-dl data and public configuration templates.\n"
+            "Secrets (.env), active downloads, virtual environments, and logs are excluded.\n",
+        )
+    return path
+
+
+async def send_backup() -> None:
+    if not config.OWNER_ID:
+        logger.warning("Skipping backup because OWNER_ID is not configured")
+        return
+    path = create_backup()
+    try:
+        if config.CHANNEL_ID:
+            await bot.send_document(
+                config.CHANNEL_ID,
+                FSInputFile(path),
+                caption=f"💾 tg-dl backup — {path.stem}",
+            )
+        await bot.send_document(
+            config.OWNER_ID,
+            FSInputFile(path),
+            caption=f"💾 tg-dl backup — {path.stem}",
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def restore_latest_backup() -> None:
+    """Restore missing/corrupt persistent data from the newest channel backup."""
+    if not config.CHANNEL_ID or mtproto is None:
+        return
+    required = [Path(config.BASE_DIR) / "bot_data.json", Path(config.BASE_DIR) / "requests.json"]
+    healthy = True
+    for path in required:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            healthy = False
+    if healthy:
+        return
+    backup_path = Path(config.BASE_DIR) / ".restore-backup.zip"
+    try:
+        async for message in mtproto.iter_messages(
+            config.CHANNEL_ID, search="💾 tg-dl backup", limit=20
+        ):
+            if not message.file:
+                continue
+            await message.download_media(file=str(backup_path))
+            if not backup_path.is_file():
+                continue
+            with zipfile.ZipFile(backup_path) as archive:
+                names = set(archive.namelist())
+                if any(name not in names for name in ("bot_data.json", "requests.json")):
+                    continue
+                for name in ("bot_data.json", "requests.json"):
+                    (Path(config.BASE_DIR) / name).write_bytes(archive.read(name))
+                for name in names:
+                    if name.startswith("thumbnails/") and Path(name).name:
+                        target = Path(config.DOWNLOAD_DIR) / "thumbnails" / Path(name).name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(archive.read(name))
+            logger.info("Restored persistent data from channel backup %s", message.id)
+            break
+    except Exception:
+        logger.exception("Could not restore data from the latest channel backup")
+    finally:
+        backup_path.unlink(missing_ok=True)
+
+
+async def backup_scheduler() -> None:
+    """Send one backup to the owner at the next local midnight, then daily."""
+    while True:
+        now = datetime.now()
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        await asyncio.sleep(max(1, (next_midnight - now).total_seconds()))
+        try:
+            await send_backup()
+        except Exception:
+            logger.exception("Daily backup failed")
+
+
 @dp.message(Command("about"))
 @guard
 async def cmd_about(message: Message):
@@ -261,6 +472,8 @@ async def cmd_admin(message: Message):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("menu:"))
 async def on_menu_cb(cb: CallbackQuery, state: FSMContext):
+    if not await guard_callback(cb):
+        return
     action = cb.data.split(":", 1)[1]
     if action == "admin":
         if cb.from_user and not is_owner(cb.from_user.id):
@@ -271,22 +484,22 @@ async def on_menu_cb(cb: CallbackQuery, state: FSMContext):
         return
     if action == "about":
         await cb.answer()
-        await cb.message.edit_text(about_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]]))
+        await safe_edit(cb.message, about_text(), InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]]))
         return
     if action == "home":
         await cb.answer()
         name = cb.from_user.first_name if cb.from_user else "there"
-        await cb.message.edit_text(welcome_text(name), reply_markup=main_menu())
+        await safe_edit(cb.message, welcome_text(name), main_menu())
         return
     if action == "dl":
         await cb.answer()
-        await cb.message.edit_text(
+        await safe_edit(cb.message,
             "📥 <b>Send me a link</b> to download.\n\n"
             "Formats:\n"
             "<code>URL</code> · <code>URL|filename.ext</code>\n"
             "<code>URL|name.ext|user|pass</code> · <code>URL * name.ext</code>\n\n"
             "You can also use <code>/dl URL</code>.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]]),
+            InlineKeyboardMarkup(inline_keyboard=[[btn("🏠 Back", "menu:home", "secondary")]]),
         )
         return
     if action in ("list", "pause", "resume", "cancel"):
@@ -298,6 +511,8 @@ async def on_menu_cb(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("dlact:"))
 async def on_dlact_cb(cb: CallbackQuery):
+    if not await guard_callback(cb):
+        return
     parts = cb.data.split(":")
     if len(parts) != 3:
         await cb.answer()
@@ -488,9 +703,9 @@ async def cmd_dl(message: Message):
     await process_link(message, combined)
 
 
-async def process_link(message: Message, raw_text: str):
-    uid = message.from_user.id
-    chat_id = message.chat.id
+async def process_link(message: Message, raw_text: str, user_id: int | None = None, chat_id: int | None = None):
+    uid = user_id if user_id is not None else message.from_user.id
+    chat_id = chat_id if chat_id is not None else message.chat.id
 
     blocked = store.cooldown_check(uid, config.COOLDOWN_SECONDS)
     if blocked:
@@ -510,6 +725,7 @@ async def process_link(message: Message, raw_text: str):
             db.touch_file(url)
             await message.answer("♻️ <b>Already downloaded</b> — resending from cache...")
             if await resend_cached(cached, chat_id):
+                db.add_history(uid, url, cached.get("name") or "cached file", cached.get("size", 0), "cached")
                 return
     db.touch_file(url)
 
@@ -608,6 +824,8 @@ def format_kb(token: str) -> InlineKeyboardMarkup:
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("req:"))
 async def on_request_cb(cb: CallbackQuery):
+    if not await guard_callback(cb):
+        return
     if not cb.message:
         await cb.answer()
         return
@@ -661,6 +879,7 @@ async def on_request_cb(cb: CallbackQuery):
 
         artifact.setdefault("_url", rec["parsed"]["source_url"])
         await upload_artifact(chat_id=cb.message.chat.id, user_id=cb.from_user.id, artifact=artifact, status_msg=status_msg)
+        db.add_history(cb.from_user.id, artifact["_url"], artifact.get("file_name", "unnamed"), os.path.getsize(artifact["path"]))
     except Exception as exc:
         logger.exception("Request action failed | token=%s option=%s", token, option_id)
         try:
@@ -1176,12 +1395,41 @@ class AdminState(StatesGroup):
     add_user = State()
 
 
+@dp.callback_query(lambda c: c.data == "backup:create")
+async def on_backup_cb(cb: CallbackQuery):
+    if not cb.from_user or not is_owner(cb.from_user.id):
+        await cb.answer("⛔ Owner only", show_alert=True)
+        return
+    try:
+        await send_backup()
+        await cb.answer("Backup sent to your private chat.")
+    except Exception:
+        logger.exception("Manual backup failed")
+        await cb.answer("Backup failed. Check the bot log.", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data == "access:toggle")
+async def on_access_toggle_cb(cb: CallbackQuery):
+    if not cb.from_user or not is_owner(cb.from_user.id):
+        await cb.answer("⛔ Owner only", show_alert=True)
+        return
+    mode = "public" if db.get_access_mode() == "private" else "private"
+    db.set_access_mode(mode)
+    await cb.answer(f"Access is now {mode}")
+    await safe_edit(cb.message, admin_panel_text(), admin_panel_kb())
+
+
 def admin_panel_text() -> str:
     admins = db.get_admins()
-    lines = [f"🛠️ <b>Admin Panel</b>\n\nOwner: <code>{config.OWNER_ID}</code>\n\n<b>Granted users:</b>"]
+    mode = db.get_access_mode()
+    lines = [f"🛠️ <b>Admin Panel</b>\n\nAccess: <b>{mode}</b>\nOwner: <a href=\"tg://user?id={config.OWNER_ID}\">{config.OWNER_ID}</a>\n\n<b>Granted users:</b>"]
     if admins:
         for a in admins:
-            lines.append(f"• <code>{a}</code>")
+            user = db.get_user(a)
+            label = user.get("first_name") or user.get("username") or str(a)
+            if user.get("username"):
+                label = f"{label} (@{user['username']})"
+            lines.append(f"• <a href=\"tg://user?id={a}\">{html.escape(label)}</a>")
     else:
         lines.append("• (none)")
     lines.append(f"\nChannel: <code>{config.CHANNEL_ID}</code>")
@@ -1190,12 +1438,45 @@ def admin_panel_text() -> str:
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
     kb = [
+        [btn("🌐 Toggle public/private", "access:toggle", "primary")],
+        [btn("💾 Backup now", "backup:create", "primary")],
         [btn("➕ Add user", "admin:add", "success")],
         [btn("🗑️ Remove user", "admin:remove", "danger")],
         [btn("📋 List users", "admin:list", "primary")],
         [btn("🏠 Back", "admin:home", "secondary")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("user:"))
+async def on_user_access_cb(cb: CallbackQuery):
+    if not cb.from_user or not is_owner(cb.from_user.id):
+        await cb.answer("⛔ Owner only", show_alert=True)
+        return
+    parts = cb.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await cb.answer("Invalid user.", show_alert=True)
+        return
+    user_id = int(parts[2])
+    if parts[1] == "grant":
+        db.unban_user(user_id)
+        db.add_admin(user_id)
+        await cb.answer("Access granted.")
+        try:
+            await bot.send_message(user_id, "✅ The owner granted you access to the downloader bot.")
+        except Exception:
+            logger.warning("Could not notify granted user %s", user_id)
+    elif parts[1] == "ban":
+        db.remove_admin(user_id)
+        db.ban_user(user_id)
+        await cb.answer("User banned.")
+    else:
+        await cb.answer("Unknown action.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("admin:"))
@@ -1300,8 +1581,14 @@ async def main():
         except Exception as e:
             logger.warning("Could not access channel %s: %s. Add the bot as channel admin!", config.CHANNEL_ID, e)
     await init_mtproto()
+    await restore_latest_backup()
+    backup_task = asyncio.create_task(backup_scheduler())
     logger.info("Starting bot polling...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        backup_task.cancel()
+        await asyncio.gather(backup_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

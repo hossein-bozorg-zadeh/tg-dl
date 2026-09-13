@@ -12,7 +12,12 @@ ARIA2_RPC_URL: str = os.getenv("ARIA2_RPC_URL", "http://127.0.0.1:6800/jsonrpc")
 ARIA2_SECRET: str = os.getenv("ARIA2_SECRET", "aria2botsecret")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", os.path.join(BASE_DIR, "downloads"))
+_download_dir = os.getenv("DOWNLOAD_DIR", "")
+DOWNLOAD_DIR: str = (
+    os.path.abspath(os.path.join(BASE_DIR, _download_dir))
+    if _download_dir and not os.path.isabs(_download_dir)
+    else (_download_dir or os.path.join(BASE_DIR, "downloads"))
+)
 
 # proxies.json uploaded to the bot (owner-only) takes priority over YTDLP_PROXIES env.
 PROXIES_JSON: str = os.getenv("PROXIES_JSON", os.path.join(BASE_DIR, "proxies.json"))

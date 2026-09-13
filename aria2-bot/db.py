@@ -12,7 +12,7 @@ LOCK = threading.Lock()
 
 def _load() -> dict:
     if not os.path.exists(DB_PATH):
-        return {"admins": [], "files": {}}
+        return {"admins": [], "files": {}, "users": {}, "history": {}, "settings": {}}
     with open(DB_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -51,7 +51,90 @@ def remove_admin(user_id: int) -> None:
 def is_allowed(user_id: int) -> bool:
     if user_id == config.OWNER_ID:
         return True
+    if user_id in get_banned():
+        return False
+    if get_access_mode() == "public":
+        return True
     return user_id in get_admins() or user_id in config.ALLOWED_USERS
+
+
+def get_banned() -> list[int]:
+    with LOCK:
+        return list(_load().get("settings", {}).get("banned", []))
+
+
+def ban_user(user_id: int) -> None:
+    with LOCK:
+        data = _load()
+        banned = data.setdefault("settings", {}).setdefault("banned", [])
+        if user_id not in banned:
+            banned.append(user_id)
+        _save(data)
+
+
+def unban_user(user_id: int) -> None:
+    with LOCK:
+        data = _load()
+        banned = data.setdefault("settings", {}).setdefault("banned", [])
+        if user_id in banned:
+            banned.remove(user_id)
+        _save(data)
+
+
+def is_known_user(user_id: int) -> bool:
+    with LOCK:
+        return str(user_id) in _load().get("users", {})
+
+
+def get_access_mode() -> str:
+    with LOCK:
+        return _load().get("settings", {}).get("access_mode", "private")
+
+
+def set_access_mode(mode: str) -> None:
+    if mode not in {"public", "private"}:
+        raise ValueError("access mode must be public or private")
+    with LOCK:
+        data = _load()
+        data.setdefault("settings", {})["access_mode"] = mode
+        _save(data)
+
+
+def record_user(user_id: int, first_name: str = "", username: str = "") -> None:
+    with LOCK:
+        data = _load()
+        data.setdefault("users", {})[str(user_id)] = {
+            "id": user_id,
+            "first_name": first_name or "",
+            "username": username or "",
+            "updated_at": int(time.time()),
+        }
+        _save(data)
+
+
+def get_user(user_id: int) -> dict:
+    with LOCK:
+        return dict(_load().get("users", {}).get(str(user_id), {"id": user_id}))
+
+
+def add_history(user_id: int, url: str, name: str, size: int, status: str = "completed") -> None:
+    with LOCK:
+        data = _load()
+        entries = data.setdefault("history", {}).setdefault(str(user_id), [])
+        entries.insert(0, {
+            "url": url,
+            "name": name,
+            "size": size,
+            "status": status,
+            "timestamp": int(time.time()),
+        })
+        del entries[50:]
+        _save(data)
+
+
+def get_history(user_id: int, limit: int = 50) -> list[dict]:
+    with LOCK:
+        return list(_load().get("history", {}).get(str(user_id), [])[:limit])
 
 
 # ---- File cache / dedupe index -------------------------------------------

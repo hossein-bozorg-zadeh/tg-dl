@@ -260,12 +260,23 @@ URL * name.mp4                       → alternate rename format
 | `/start` | Welcome menu (glass buttons) + admin panel |
 | `/help` | List commands |
 | `/list` | Show active, queued, and finished downloads |
+| `/history` | Show your completed download history |
 | `/status <gid>` | Check one download |
 | `/pause <gid>` | Pause a download |
 | `/resume <gid>` | Resume a download |
 | `/cancel <gid>` | Cancel and remove a download |
 | `/thumb` | View your custom thumbnail |
 | `/delthumb` | Delete your thumbnail |
+
+The owner can use `/admin` to toggle between **private** access (owner,
+granted users, and `ALLOWED_USERS`) and **public** access (any Telegram user).
+The admin user list shows clickable Telegram profile links for users who have
+already interacted with the bot.
+The admin panel's **Backup now** button sends a backup to the owner; an
+additional backup is sent automatically at local midnight every day. Backups
+include persistent data, history, request state, thumbnails, and public
+configuration templates, but exclude `.env` secrets, active downloads, logs,
+and virtual environments.
 
 ### Format-selection menu
 

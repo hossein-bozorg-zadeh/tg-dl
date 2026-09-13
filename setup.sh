@@ -32,10 +32,16 @@ err()   { printf "${RED}[ERROR]${NC} %s\n" "$*"; }
 step()  { printf "\n${CYAN}==> ${NC}%s\n" "$*"; }
 
 # Prompt helper: asks and returns the value in REPLY (uses default if empty).
+# In non-interactive mode, an explicitly exported environment variable wins over
+# the value from a previous .env file.
 ask() {
-    local prompt="$1" default="$2" input
+    local prompt="$1" default="$2" env_name="${3:-}" input
     if [[ "${NONINTERACTIVE:-0}" == "1" ]]; then
-        REPLY="${default}"
+        if [[ -n "${env_name}" && -n "${!env_name+x}" ]]; then
+            REPLY="${!env_name}"
+        else
+            REPLY="${default}"
+        fi
         return 0
     fi
     if [[ -n "${default}" ]]; then
@@ -93,8 +99,11 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
             apt-get update -y
             apt-get install -y aria2 megatools ffmpeg python3 python3-pip python3-venv curl
             ;;
-        dnf|yum)
+        dnf)
             dnf install -y aria2 megatools ffmpeg python3 python3-pip curl
+            ;;
+        yum)
+            yum install -y aria2 megatools ffmpeg python3 python3-pip curl
             ;;
         pacman)
             pacman -S --noconfirm aria2 megatools ffmpeg python python-pip curl
@@ -168,17 +177,17 @@ env_val() { # $1 = key, reads from existing .env
     return 0
 }
 
-ask "BOT_TOKEN (from @BotFather)"                 "$(env_val BOT_TOKEN)"
+ask "BOT_TOKEN (from @BotFather)"                 "$(env_val BOT_TOKEN)" BOT_TOKEN
 BOT_TOKEN="${REPLY}"
-ask "OWNER_ID (your numeric Telegram ID)"         "$(env_val OWNER_ID)"
+ask "OWNER_ID (your numeric Telegram ID)"         "$(env_val OWNER_ID)" OWNER_ID
 OWNER_ID="${REPLY}"
-ask "CHANNEL_ID (private channel, bot must be admin)" "$(env_val CHANNEL_ID)"
+ask "CHANNEL_ID (private channel, bot must be admin)" "$(env_val CHANNEL_ID)" CHANNEL_ID
 CHANNEL_ID="${REPLY}"
-ask "TELEGRAM_API_ID (from my.telegram.org, for >49MiB uploads)" "$(env_val TELEGRAM_API_ID)"
+ask "TELEGRAM_API_ID (from my.telegram.org, for >49MiB uploads)" "$(env_val TELEGRAM_API_ID)" TELEGRAM_API_ID
 TELEGRAM_API_ID="${REPLY}"
-ask "TELEGRAM_API_HASH"                           "$(env_val TELEGRAM_API_HASH)"
+ask "TELEGRAM_API_HASH"                           "$(env_val TELEGRAM_API_HASH)" TELEGRAM_API_HASH
 TELEGRAM_API_HASH="${REPLY}"
-ask "ALLOWED_USERS (comma-separated, empty=everyone)" "$(env_val ALLOWED_USERS)"
+ask "ALLOWED_USERS (comma-separated, empty=everyone)" "$(env_val ALLOWED_USERS)" ALLOWED_USERS
 ALLOWED_USERS="${REPLY}"
 
 # ---------------------------------------------------------------------------
@@ -253,7 +262,7 @@ fi
 # 5. Choose download directory
 # ---------------------------------------------------------------------------
 step "Choosing download directory"
-ask "DOWNLOAD_DIR (temp storage, cleaned after upload)" "$(env_val DOWNLOAD_DIR)"
+ask "DOWNLOAD_DIR (temp storage, cleaned after upload)" "$(env_val DOWNLOAD_DIR)" DOWNLOAD_DIR
 DOWNLOAD_DIR="${REPLY:-${BOT_DIR}/downloads}"
 mkdir -p "${DOWNLOAD_DIR}"
 
@@ -320,17 +329,21 @@ info ".env written"
 # 7. Point aria2.conf at the chosen download dir
 # ---------------------------------------------------------------------------
 step "Patching aria2.conf download dir"
+touch "${BOT_DIR}/session.txt"
 if [[ -f "${CONF_FILE}" ]]; then
     grep -q '^dir=' "${CONF_FILE}" || echo "dir=${DOWNLOAD_DIR}" >> "${CONF_FILE}"
     sed -i "s|^dir=.*|dir=${DOWNLOAD_DIR}|" "${CONF_FILE}"
+    sed -i "s|^input-file=.*|input-file=${BOT_DIR}/session.txt|" "${CONF_FILE}"
+    sed -i "s|^save-session=.*|save-session=${BOT_DIR}/session.txt|" "${CONF_FILE}"
 else
     warn "aria2.conf missing — writing a default one"
     cat > "${CONF_FILE}" <<EOF
 enable-rpc=true
-rpc-listen-all=true
+rpc-listen-all=false
+rpc-listen=127.0.0.1
 rpc-listen-port=6800
 rpc-secret=aria2botsecret
-rpc-allow-origin-all=true
+rpc-allow-origin-all=false
 dir=${DOWNLOAD_DIR}
 max-concurrent-downloads=5
 continue=true
