@@ -14,7 +14,7 @@ Send any link (or a `.torrent` file) to the bot and it downloads the file on the
   - YouTube — quality/format selection menu (1080p/720p/... + MP3)
   - 1000+ sites supported by yt-dlp (Twitch, Vimeo, TikTok, Instagram, ...)
 - **Quality & format picker** — when a source exposes multiple formats, the bot shows a button menu to choose from
-- **YouTube bot-detection workarounds** — self-hosted Koutube instance (direct links via Invidious), cookies file, rotating proxy list, and a server-side download API fallback (dlapi) so your server's IP doesn't get blocked
+- **YouTube bot-detection workarounds** — self-hosted cobalt instance (tunnels media through its own server), self-hosted Koutube instance (direct links via Invidious), cookies file, rotating proxy list, and a server-side download API fallback (dlapi) so your server's IP doesn't get blocked
 - **Live progress bars** — download and upload progress are shown in an in-place edited message
 - **Uploads up to 2 GiB** via MTProto (Telethon); files larger than 2 GiB are **split** into parts < 1.5 GiB
 - **Private-channel storage** — every file is uploaded to the owner's private channel and indexed
@@ -36,7 +36,8 @@ Telegram user <-> Bot (aiogram + Telethon) <-> aria2 RPC (port 6800) <-> interne
 - **aiogram** handles Telegram Bot API messages and inline buttons.
 - **Telethon** (MTProto) handles large file uploads (> 49 MiB up to 2 GiB).
 - **yt-dlp** probes and downloads media sites; **megatools** handles Mega; **ffmpeg** muxes/transcodes when needed.
-- **Koutube** (optional, self-hosted) proxies YouTube through Invidious and returns direct download links, completely avoiding YouTube bot-detection.
+- **cobalt** (optional, self-hosted) tunnels media through its own server — YouTube never sees your IP, so no bot-detection.
+- **Koutube** (optional, self-hosted) proxies YouTube through Invidious and returns direct download links.
 
 ## Project layout
 
@@ -48,6 +49,7 @@ aria2-bot/
 ├── downloaders.py     # URL detection + mega/mediafire/aria2 download helpers
 ├── parsing.py         # link format parsing (URL|name|user|pass, URL * name)
 ├── ytdlp.py           # yt-dlp probe, download, format/quality builders, proxy+cookie handling
+├── cobalt.py          # client for a self-hosted cobalt instance (tunnel media downloads)
 ├── koutube.py         # client for a Koutube instance (direct YouTube links via Invidious)
 ├── dlapi.py           # client for dlapi.yebekhe.workers.dev (server-side download fallback)
 ├── media.py           # video/audio metadata (hachoir)
@@ -123,8 +125,9 @@ It will ask you for:
 - `CHANNEL_ID` — your private channel (bot must be admin)
 - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — for >49 MiB uploads
 - `ALLOWED_USERS` — optional extra users (comma-separated)
-- `KOUTUBE_BASE_URL` — enter `public` for the public koutu.be, a self-hosted
-  URL, or leave empty to skip (see the Koutube guide below)
+- **Deploy cobalt?** — the wizard can spin up a self-hosted cobalt instance via Docker (recommended: tunnels YouTube media through its own server, no bot-check)
+- `COBALT_API_URL` — your cobalt instance URL, or empty to skip
+- `KOUTUBE_BASE_URL` — enter `public` for the public koutu.be, a self-hosted URL, or leave empty to skip (see the Koutube guide below)
 
 Non-interactive / scripted installs are supported too:
 
@@ -164,6 +167,7 @@ nano .env
 | `HTTP_PROXY` | Single proxy for yt-dlp / direct downloads (optional) |
 | `YTDLP_PROXIES` | Comma-separated proxy list, rotated per yt-dlp request |
 | `YTDLP_COOKIES` | Path to a `cookies.txt` for YouTube (fixes bot-check) |
+| `COBALT_API_URL` | Self-hosted cobalt instance URL (tunnels media; e.g. `http://127.0.0.1:9000`); empty = disabled |
 | `KOUTUBE_BASE_URL` | Koutube instance for direct YouTube links (self-hosted or `https://koutu.be`); empty = disabled |
 
 ### 5.2 Fix the aria2 download dir
@@ -290,9 +294,10 @@ The owner can press **🛠️ Admin** in `/start` to open the panel:
 If YouTube shows *"Sign in to confirm you're not a bot"*, the bot tries these
 in order:
 
-1. **Koutube** (if `KOUTUBE_BASE_URL` is set) — generates direct download links on another server, so your server's IP never talks to YouTube. See the self-hosting guide below.
-2. **dlapi fallback** — `dlapi.yebekhe.workers.dev` (a free server-side downloader). Used automatically when Koutube is disabled or the service is reachable.
-3. **yt-dlp with cookies/proxies** — as a last resort.
+1. **cobalt** (if `COBALT_API_URL` is set) — tunnels the media through its own server, so your server's IP never talks to YouTube. See the self-hosting guide below.
+2. **Koutube** (if `KOUTUBE_BASE_URL` is set) — generates direct download links on another server via Invidious.
+3. **dlapi fallback** — `dlapi.yebekhe.workers.dev` (a free server-side downloader). Used automatically when the services above are disabled or unreachable.
+4. **yt-dlp with cookies/proxies** — as a last resort.
 
 You can also help yt-dlp directly:
 
@@ -312,6 +317,50 @@ You can also help yt-dlp directly:
    ```
 
 > Tip: free/datacenter proxies are often flagged by YouTube too. Residential proxies (Bright Data, Oxylabs, Smartproxy, or your own home IP) work best.
+
+### Self-host cobalt (recommended for personal servers)
+
+[cobalt](https://github.com/imputnet/cobalt) is a media downloader that works
+like a fancy proxy: it fetches the media on its own server and **tunnels** the
+file back to you. Your server's IP is never seen by YouTube, so the
+"Sign in to confirm you're not a bot" wall disappears entirely. It also covers
+Twitter, Instagram, TikTok, SoundCloud, Reddit and more.
+
+The bot has a built-in client for any cobalt instance (`cobalt.py`). Set
+`COBALT_API_URL` in `.env` and the bot uses it as the **primary** YouTube path.
+
+The wizard can deploy cobalt for you automatically. To do it by hand:
+
+```bash
+# 1. Install Docker: https://docs.docker.com/engine/install/
+# 2. Create a compose file
+mkdir -p ~/cobalt && cat > ~/cobalt/docker-compose.yml <<'EOF'
+services:
+    cobalt:
+        image: ghcr.io/imputnet/cobalt:11
+        init: true
+        read_only: true
+        restart: unless-stopped
+        container_name: cobalt
+        ports:
+            - 127.0.0.1:9000:9000/tcp
+        environment:
+            API_URL: "http://127.0.0.1:9000/"
+EOF
+
+# 3. Start it
+cd ~/cobalt && docker compose up -d
+```
+
+Then point the bot at it:
+
+```bash
+# in aria2-bot/.env
+COBALT_API_URL=http://127.0.0.1:9000
+```
+
+> The public `api.cobalt.tools` is bot-protected and explicitly **not** meant
+> for other projects — always self-host your own instance.
 
 ### Self-host Koutube (recommended for personal servers)
 

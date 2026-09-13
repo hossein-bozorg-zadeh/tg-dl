@@ -20,6 +20,7 @@ from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeFilename
 
 import config
+import cobalt
 import db
 import dlapi
 import downloaders
@@ -514,7 +515,19 @@ async def process_link(message: Message, raw_text: str):
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
-        # 1) Koutube first (if configured): direct links via Invidious,
+        # 1) Cobalt first (if configured): tunnels media through the cobalt
+        #    server, so YouTube never sees our IP (no bot-detection).
+        if config.COBALT_API_URL:
+            try:
+                cobalt_options = await cobalt.build_options(config.COBALT_API_URL, url)
+            except Exception as e:
+                logger.info("cobalt failed, continuing: %s", e)
+                cobalt_options = []
+            if cobalt_options:
+                token = store.create_request("ytdlp_selection", parsed, cobalt_options, {})
+                await message.answer("🎥 <b>YouTube detected</b> — pick a quality/format:", reply_markup=format_kb(token))
+                return
+        # 2) Koutube next (if configured): direct links via Invidious,
         #    completely bypasses YouTube bot-detection.
         if config.KOUTUBE_BASE_URL:
             try:
@@ -526,7 +539,7 @@ async def process_link(message: Message, raw_text: str):
                 token = store.create_request("ytdlp_selection", parsed, koutube_options, {})
                 await message.answer("🎥 <b>YouTube detected</b> — pick a quality/format:", reply_markup=format_kb(token))
                 return
-        # 2) Try dlapi service next: gives direct links, bypasses bot-detection.
+        # 3) Try dlapi service next: gives direct links, bypasses bot-detection.
         dlapi_data = await dlapi.fetch_youtube(url)
         dlapi_options = dlapi.build_options(dlapi_data) if dlapi_data else []
         if dlapi_options:
@@ -754,7 +767,7 @@ async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
     """Download a direct URL obtained from the dlapi service via aria2."""
     url = option.get("url") or parsed.source_url
     ext = option.get("file_ext")
-    out_name = parsed.custom_file_name or ""
+    out_name = parsed.custom_file_name or option.get("file_name") or ""
     if not out_name:
         out_name = f"dlapi_download.{ext}" if ext else "dlapi_download.mp4"
     out_name = clean_filename(out_name)

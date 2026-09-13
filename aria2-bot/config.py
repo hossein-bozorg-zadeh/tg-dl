@@ -217,6 +217,13 @@ YTDLP_COOKIES: str = os.getenv("YTDLP_COOKIES", "").strip()
 # Empty = koutube disabled (falls back to dlapi / yt-dlp).
 KOUTUBE_BASE_URL: str = os.getenv("KOUTUBE_BASE_URL", "").strip().rstrip("/")
 
+# Self-hosted cobalt instance (https://github.com/imputnet/cobalt).
+# Cobalt fetches media on its own servers and tunnels the file back, so the
+# bot's IP is never seen by YouTube (no bot-detection).
+# Example: http://127.0.0.1:9000
+# The public api.cobalt.tools is bot-protected — self-host via docker compose.
+COBALT_API_URL: str = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
 
