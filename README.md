@@ -18,11 +18,12 @@ Send any link (or a `.torrent` file) to the bot and it downloads the file on the
 - **Live progress bars** — download and upload progress are shown in an in-place edited message
 - **Uploads up to 2 GiB** via MTProto (Telethon); files larger than 2 GiB are **split** into parts < 1.5 GiB
 - **Private-channel storage** — every file is uploaded to the owner's private channel and indexed
-- **7-day cache** — requesting the same link again within 7 days re-sends it from the channel instantly (no re-download)
+- **7-day cache** — requesting the same link again within 7 days re-sends it from the channel instantly (no re-download); the cache is **per user**, so one user's cached file is never sent to another
 - **No server retention** — local files and progress messages are deleted after upload
 - **Admin panel** — owner can grant/revoke access for friends, all in-chat via buttons
 - **Pause / resume / cancel / status / list** for active downloads
 - **Per-user custom thumbnails**
+- **Hardened defaults** — per-user cache, a per-user download cap, and an SSRF guard that blocks loopback/private/metadata targets while in **public** mode
 
 ## How it works
 
@@ -160,6 +161,7 @@ nano .env
 | `ARIA2_SECRET` | Must match `rpc-secret` in `aria2.conf` |
 | `DOWNLOAD_DIR` | Where downloads are staged (cleaned after upload) |
 | `COOLDOWN_SECONDS` | Cooldown between requests for non-authorized users |
+| `MAX_CONCURRENT_DOWNLOADS` | Max downloads a single user may run at once (default 3, `0` = unlimited) |
 | `CACHE_TTL_DAYS` | Channel-cache lifetime for re-sending the same link (default 7) |
 | `SPLIT_THRESHOLD` | Files above this size are split (default 2 GiB) |
 | `SPLIT_PART_SIZE` | Split part size (default 1.5 GiB) |
@@ -169,6 +171,7 @@ nano .env
 | `YTDLP_COOKIES` | Path to a `cookies.txt` for YouTube (fixes bot-check) |
 | `COBALT_API_URL` | Self-hosted cobalt instance URL (tunnels media; e.g. `http://127.0.0.1:9000`); empty = disabled |
 | `KOUTUBE_BASE_URL` | Koutube instance for direct YouTube links (self-hosted or `https://koutu.be`); empty = disabled |
+| `DLAPI_BASE_URL` | dlapi downloader base URL (default `https://dlapi.yebekhe.workers.dev`) |
 
 ### 5.2 Fix the aria2 download dir
 
@@ -272,6 +275,12 @@ The owner can use `/admin` to toggle between **private** access (owner,
 granted users, and `ALLOWED_USERS`) and **public** access (any Telegram user).
 The admin user list shows clickable Telegram profile links for users who have
 already interacted with the bot.
+
+> **Public mode is guarded harder.** When the bot is public, incoming links are
+> checked by an SSRF guard (loopback, private LAN, link-local/cloud-metadata and
+> reserved addresses are refused) and each user is limited to
+> `MAX_CONCURRENT_DOWNLOADS` simultaneous downloads. In private mode the trusted
+> set is left unrestricted. The channel cache is always **per user**.
 The admin panel's **Backup now** button sends a backup to the owner; an
 additional backup is sent automatically at local midnight every day. Backups
 include persistent data, history, request state, thumbnails, and public
@@ -442,4 +451,4 @@ Or, when using the wizard, enter the URL when asked for `KOUTUBE_BASE_URL`.
 
 ## License
 
-This project is open source.
+Released under the [MIT License](LICENSE).

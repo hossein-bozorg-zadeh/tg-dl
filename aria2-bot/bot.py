@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 import html
 import inspect
 import json
@@ -11,6 +10,7 @@ import shutil
 import time
 import zipfile
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -21,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
 import config
 import cobalt
@@ -30,6 +30,7 @@ import dlapi
 import downloaders
 import koutube
 import media
+import netguard
 import parsing
 import store
 import ytdlp
@@ -40,7 +41,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(config.BASE_DIR, "bot.log")),
+        RotatingFileHandler(
+            os.path.join(config.BASE_DIR, "bot.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
     ],
 )
 logger = logging.getLogger("aria2bot")
@@ -55,7 +61,6 @@ dp = Dispatcher()
 
 mtproto: TelegramClient | None = None
 
-URL_SCHEMES = ("http://", "https://", "ftp://", "magnet:?")
 BAR_FULL = "▓"
 BAR_EMPTY = "░"
 MAX_FORMAT_BUTTONS = 24
@@ -163,10 +168,6 @@ def guard_owner(func):
 
 def clean_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip()
-
-
-def url_digest(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -342,7 +343,7 @@ async def on_history_cb(cb: CallbackQuery):
         await cb.answer("That history item is no longer available.", show_alert=True)
         return
     item = entries[index]
-    cached = db.find_file(item.get("url", ""))
+    cached = db.find_file(item.get("url", ""), cb.from_user.id)
     if cached and cached.get("parts") and await resend_cached(cached, cb.message.chat.id):
         db.add_history(cb.from_user.id, item.get("url", ""), item.get("name", "cached file"), item.get("size", 0), "cached")
         await cb.answer("Sent from cache.")
@@ -456,6 +457,12 @@ async def backup_scheduler() -> None:
             await send_backup()
         except Exception:
             logger.exception("Daily backup failed")
+        try:
+            removed = db.prune_files(config.CACHE_TTL_DAYS)
+            if removed:
+                logger.info("Pruned %s expired cache entries", removed)
+        except Exception:
+            logger.exception("Cache pruning failed")
 
 
 @dp.message(Command("about"))
@@ -575,7 +582,7 @@ async def show_downloads(message: Message, action: str):
     rows.append([btn("🏠 Back", "menu:home", "secondary")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
-        await message.edit_text(f"<pre>{text}</pre>", reply_markup=kb)
+        await message.edit_text(f"<pre>{html.escape(text)}</pre>", reply_markup=kb)
     except Exception:
         pass
 
@@ -622,10 +629,6 @@ async def cmd_delthumb(message: Message):
 # --------------------------------------------------------------------------
 # Downloads (intake)
 # --------------------------------------------------------------------------
-
-def _filter_link_parts(parts: list[str]) -> list[str]:
-    return [p for p in parts if p.startswith(("http://", "https://", "ftp://", "magnet:?"))]
-
 
 @dp.message(F.text, StateFilter(None))
 @guard
@@ -717,17 +720,22 @@ async def process_link(message: Message, raw_text: str, user_id: int | None = No
     kind = downloaders.detect(url)
     logger.info("Incoming link | user=%s chat=%s kind=%s url=%s", uid, chat_id, kind, url[:120])
 
+    # SSRF guard: enforced only in public mode (the private set is trusted).
+    if db.get_access_mode() == "public" and not await netguard.is_safe_url(url):
+        await message.answer("⛔ That link points to a private or internal address and is not allowed.")
+        return
+
     # 7-day cache: same link requested within CACHE_TTL_DAYS is re-sent from the channel
-    cached = db.find_file(url)
+    cached = db.find_file(url, uid)
     if cached and cached.get("parts"):
         age = time.time() - cached.get("last_request", 0)
         if age < config.CACHE_TTL_DAYS * 86400:
-            db.touch_file(url)
+            db.touch_file(url, uid)
             await message.answer("♻️ <b>Already downloaded</b> — resending from cache...")
             if await resend_cached(cached, chat_id):
                 db.add_history(uid, url, cached.get("name") or "cached file", cached.get("size", 0), "cached")
                 return
-    db.touch_file(url)
+    db.touch_file(url, uid)
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
@@ -860,6 +868,12 @@ async def on_request_cb(cb: CallbackQuery):
         username=rec["parsed"].get("username"),
         password=rec["parsed"].get("password"),
     )
+    if not store.acquire_download(cb.from_user.id, config.MAX_CONCURRENT_DOWNLOADS):
+        await cb.answer(
+            "⏳ You already have the maximum number of downloads running. Wait for one to finish.",
+            show_alert=True,
+        )
+        return
     work_dir = store.work_directory(token)
     status_msg = cb.message
 
@@ -883,10 +897,11 @@ async def on_request_cb(cb: CallbackQuery):
     except Exception as exc:
         logger.exception("Request action failed | token=%s option=%s", token, option_id)
         try:
-            await status_msg.edit_text(f"{'❌ I could not process that link.'}\n<code>{exc}</code>")
+            await status_msg.edit_text(f"{'❌ I could not process that link.'}\n<code>{html.escape(str(exc))}</code>")
         except Exception:
             pass
     finally:
+        store.release_download(cb.from_user.id)
         store.delete_request(token)
         shutil.rmtree(work_dir, ignore_errors=True)
         await cb.answer()
@@ -955,7 +970,7 @@ async def direct_download(parsed, option, settings, work_dir, info=None, status_
             path = files[0] if files else None
             if not path:
                 raise RuntimeError("No file after download")
-        return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": parsed.custom_file_name or os.path.basename(path)}
+        return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
     # Default aria2 path (no custom name)
     gid, _ = await downloaders.download_with_aria2(aria2, url, str(work_dir))
@@ -979,7 +994,7 @@ async def direct_download(parsed, option, settings, work_dir, info=None, status_
     if not files:
         raise RuntimeError("No file after download")
     path = files[0]
-    return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": parsed.custom_file_name or os.path.basename(path)}
+    return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
 
 async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
@@ -1024,7 +1039,7 @@ async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
         send_type = "audio"
     elif ext and ext.lower() in ("mp4", "mkv", "webm", "mov", "avi", "flv"):
         send_type = "video"
-    return {"path": path, "file_name": os.path.basename(path), "send_type": send_type, "caption": parsed.custom_file_name or os.path.basename(path)}
+    return {"path": path, "file_name": os.path.basename(path), "send_type": send_type, "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
 
 async def mega_download(parsed, option, settings, work_dir, status_msg=None):
@@ -1032,12 +1047,10 @@ async def mega_download(parsed, option, settings, work_dir, status_msg=None):
     if not status_msg:
         raise RuntimeError("status message required")
 
-    async def progress_cb(done, total, speed):
-        pct = (done / total * 100) if total > 0 else 0
+    async def progress_cb(pct):
         try:
             await status_msg.edit_text(
-                f"🅼 <b>Downloading from Mega</b>\n<code>{bar(pct)}</code> {pct:.1f}%\n"
-                f"📦 {_fmt_size(done)} / {_fmt_size(total)}"
+                f"🅼 <b>Downloading from Mega</b>\n<code>{bar(pct)}</code> {pct:.1f}%"
             )
         except Exception:
             pass
@@ -1057,7 +1070,7 @@ async def mega_download(parsed, option, settings, work_dir, status_msg=None):
         "path": path,
         "file_name": out_name,
         "send_type": "document",
-        "caption": out_name,
+        "caption": html.escape(out_name),
         "_url": parsed.source_url,
     }
 
@@ -1105,7 +1118,7 @@ async def mediafire_download(parsed, option, settings, work_dir, status_msg=None
         "path": path,
         "file_name": out_name,
         "send_type": "document",
-        "caption": out_name,
+        "caption": html.escape(out_name),
         "_url": parsed.source_url,
     }
 
@@ -1180,8 +1193,10 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
     except Exception:
         pass
 
-    # Files above the Telegram size cap are split into parts and uploaded as documents.
-    if size <= config.MAX_MT_PROTO_SIZE:
+    # Files above the split threshold (capped by the Telegram size limit) are
+    # split into parts and uploaded as documents.
+    split_limit = min(config.SPLIT_THRESHOLD, config.MAX_MT_PROTO_SIZE)
+    if size <= split_limit:
         parts = [path]
     else:
         try:
@@ -1189,7 +1204,7 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
         except Exception as e:
             logger.error("split failed: %s", e)
             await status_msg.edit_text(
-                f"⚠️ <b>{name}</b> ({_fmt_size(size)}) is too large for Telegram and splitting failed.\nFile kept on server.\n<code>{path}</code>",
+                f"⚠️ <b>{html.escape(name)}</b> ({_fmt_size(size)}) is too large for Telegram and splitting failed.\nFile kept on server.\n<code>{html.escape(str(path))}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1207,7 +1222,7 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
             except Exception as e:
                 logger.error("channel upload failed: %s", e)
         if stored_parts:
-            db.set_file_parts(cache_key, name, size, stored_parts)
+            db.set_file_parts(cache_key, name, size, stored_parts, user_id)
             log_rec = (
                 f"📄 <b>New download</b>\n"
                 f"File: <b>{name}</b>\nSize: {_fmt_size(size)}"
@@ -1271,12 +1286,21 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
         return
 
     if size <= config.MAX_MT_PROTO_SIZE and mtproto is not None:
+        attributes = [DocumentAttributeFilename(file_name=name)]
+        if send_type == "video":
+            width, height, duration = media.video_metadata(Path(path))
+            attributes.append(
+                DocumentAttributeVideo(
+                    duration=duration, w=width, h=height, supports_streaming=True
+                )
+            )
         await mtproto.send_file(
             chat_id,
             path,
             caption=caption,
+            parse_mode="html",
             force_document=(send_type == "document"),
-            attributes=[DocumentAttributeFilename(file_name=name)],
+            attributes=attributes,
             part_size_kib=1024,
             file_size=size,
             progress_callback=progress_cb,
@@ -1284,7 +1308,7 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
         return
 
     await status_msg.edit_text(
-        f"⚠️ <b>{name}</b> ({_fmt_size(size)}) is too large for Telegram.\nFile kept on server.\n<code>{path}</code>",
+        f"⚠️ <b>{html.escape(name)}</b> ({_fmt_size(size)}) is too large for Telegram.\nFile kept on server.\n<code>{html.escape(str(path))}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1312,7 +1336,7 @@ async def upload_to_channel(path: str, name: str, progress_cb=None) -> int:
 # Status / control commands
 # --------------------------------------------------------------------------
 
-@dp.message(Command("list"))
+@dp.message(Command("list"), StateFilter(None))
 @guard
 async def cmd_list(message: Message):
     try:
@@ -1325,10 +1349,10 @@ async def cmd_list(message: Message):
         return
     from aria2_client import Aria2Client
     text = "\n\n".join(Aria2Client.format_status(it) for it in items[:6])
-    await message.answer(f"<pre>{text}</pre>")
+    await message.answer(f"<pre>{html.escape(text)}</pre>")
 
 
-@dp.message(Command("status"))
+@dp.message(Command("status"), StateFilter(None))
 @guard
 async def cmd_status(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1341,10 +1365,10 @@ async def cmd_status(message: Message):
     except RuntimeError as e:
         await message.answer(f"❌ {e}")
         return
-    await message.answer(f"<pre>{Aria2Client.format_status(st)}</pre>")
+    await message.answer(f"<pre>{html.escape(Aria2Client.format_status(st))}</pre>")
 
 
-@dp.message(Command("pause"))
+@dp.message(Command("pause"), StateFilter(None))
 @guard
 async def cmd_pause(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1358,7 +1382,7 @@ async def cmd_pause(message: Message):
         await message.answer(f"❌ {e}")
 
 
-@dp.message(Command("resume"))
+@dp.message(Command("resume"), StateFilter(None))
 @guard
 async def cmd_resume(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1372,7 +1396,7 @@ async def cmd_resume(message: Message):
         await message.answer(f"❌ {e}")
 
 
-@dp.message(Command("cancel"))
+@dp.message(Command("cancel"), StateFilter(None))
 @guard
 async def cmd_cancel(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1528,6 +1552,10 @@ async def on_del_cb(cb: CallbackQuery):
 @guard_owner
 async def admin_add_user(message: Message, state: FSMContext):
     text = (message.text or "").strip()
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Add-user cancelled.", reply_markup=admin_panel_kb())
+        return
     ids = re.split(r"[\s,;]+", text)
     ids = [i for i in ids if i.isdigit()]
     if not ids:
@@ -1582,6 +1610,12 @@ async def main():
             logger.warning("Could not access channel %s: %s. Add the bot as channel admin!", config.CHANNEL_ID, e)
     await init_mtproto()
     await restore_latest_backup()
+    try:
+        removed = db.prune_files(config.CACHE_TTL_DAYS)
+        if removed:
+            logger.info("Pruned %s expired cache entries", removed)
+    except Exception:
+        logger.exception("Cache pruning failed")
     backup_task = asyncio.create_task(backup_scheduler())
     logger.info("Starting bot polling...")
     try:
@@ -1589,6 +1623,10 @@ async def main():
     finally:
         backup_task.cancel()
         await asyncio.gather(backup_task, return_exceptions=True)
+        await aria2.close()
+        if mtproto is not None:
+            await mtproto.disconnect()
+        await bot.session.close()
 
 
 if __name__ == "__main__":

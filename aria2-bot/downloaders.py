@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
+import time
 import urllib.parse
 
 import aiohttp
@@ -11,6 +11,9 @@ import config
 from aria2_client import Aria2Client
 
 logger = logging.getLogger("aria2bot.downloaders")
+
+# Give up if aria2 makes no progress for this long (torrents may wait for peers).
+ARIA2_STALL_TIMEOUT = 300.0
 
 MEGA_RE = re.compile(r"https?://(?:www\.|mega\.|mega\.nz/)?mega\.nz/(?:file|folder)/[^#\s]+(?:#[^\s]+)?", re.I)
 MEDIAFIRE_RE = re.compile(r"https?://(?:www\.)?mediafire\.com/(?:file|view|folder|download)/\S+", re.I)
@@ -46,18 +49,39 @@ async def download_with_aria2(aria2: Aria2Client, url: str, dir_path: str) -> tu
     return gid, 0
 
 
-async def wait_aria2(aria2: Aria2Client, gid: str, progress_cb=None, interval: float = 1.0) -> dict:
+async def wait_aria2(
+    aria2: Aria2Client,
+    gid: str,
+    progress_cb=None,
+    interval: float = 1.0,
+    timeout: float | None = None,
+    stall_timeout: float = ARIA2_STALL_TIMEOUT,
+) -> dict:
+    """Poll an aria2 download until it finishes, with a hard timeout and
+    stall detection so a stuck transfer can never hang the caller forever."""
+    if timeout is None:
+        timeout = float(config.PROCESS_MAX_TIMEOUT)
+    started = time.monotonic()
+    last_progress_at = started
+    last_completed = -1
     while True:
         st = await aria2.get_status(gid)
         status = st.get("status")
+        completed = int(st.get("completedLength") or 0)
+        total = int(st.get("totalLength") or 0)
+        speed = int(st.get("downloadSpeed") or 0)
         if progress_cb:
-            await progress_cb(
-                int(st.get("completedLength") or 0),
-                int(st.get("totalLength") or 0),
-                int(st.get("downloadSpeed") or 0),
-            )
+            await progress_cb(completed, total, speed)
         if status in ("complete", "error", "removed"):
             return st
+        now = time.monotonic()
+        if completed != last_completed:
+            last_completed = completed
+            last_progress_at = now
+        if now - started > timeout:
+            raise RuntimeError(f"download timed out after {int(timeout)}s (gid {gid})")
+        if status == "active" and now - last_progress_at > stall_timeout:
+            raise RuntimeError(f"download stalled with no progress for {int(stall_timeout)}s (gid {gid})")
         await asyncio.sleep(interval)
 
 
@@ -70,28 +94,38 @@ async def download_mega(url: str, dir_path: str, progress_cb=None) -> tuple[str,
         stderr=asyncio.subprocess.STDOUT,
     )
     assert proc.stdout is not None
-    size = 0
     name = ""
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode(errors="replace").strip()
-        if not text:
-            continue
-        logger.debug("megadl: %s", text)
-        m = re.search(r"([\d.]+) %", text)
-        if m:
-            pct = float(m.group(1))
-            if progress_cb and size > 0:
-                await progress_cb(int(size * pct / 100.0), size, 0)
-        m = re.search(r"Filename:\s*(.+)", text)
-        if m:
-            name = m.group(1).strip()
-        m = re.search(r"Download (?:file|finished)", text, re.I)
-        if m:
-            pass
-        # megatools prints nothing about total; detect via file after completion
+
+    async def consume() -> None:
+        nonlocal name
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            logger.debug("megadl: %s", text)
+            m = re.search(r"([\d.]+) %", text)
+            if m and progress_cb:
+                # megatools only reports a percentage, not byte totals.
+                await progress_cb(float(m.group(1)))
+            m = re.search(r"Filename:\s*(.+)", text)
+            if m:
+                name = m.group(1).strip()
+            m = re.search(r"Download (?:file|finished)", text, re.I)
+            if m:
+                pass
+            # megatools prints nothing about total; detect via file after completion
+
+    timeout = float(getattr(config, "PROCESS_MAX_TIMEOUT", 3700) or 3700)
+    try:
+        await asyncio.wait_for(consume(), timeout=timeout)
+    except asyncio.TimeoutError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"megadl timed out after {int(timeout)}s")
     code = await proc.wait()
     if code != 0:
         raise RuntimeError(f"megadl failed with exit code {code}")

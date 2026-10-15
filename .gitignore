@@ -1,1 +1,12 @@
+# downloaded files / runtime state
 downloads/
+backups/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# logs
+*.log

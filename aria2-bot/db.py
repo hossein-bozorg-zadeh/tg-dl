@@ -1,26 +1,63 @@
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
 
 import config
 
+logger = logging.getLogger("aria2bot.db")
+
 DB_PATH = os.path.join(config.BASE_DIR, "bot_data.json")
 LOCK = threading.Lock()
 
 
+def _default_data() -> dict:
+    return {"admins": [], "files": {}, "users": {}, "history": {}, "settings": {}}
+
+
+def _quarantine(path: str) -> None:
+    """Move an unreadable data file aside so the bot can keep running."""
+    try:
+        broken = f"{path}.corrupt-{int(time.time())}"
+        os.replace(path, broken)
+        logger.error("Moved unreadable data file to %s", broken)
+    except OSError:
+        logger.exception("Could not quarantine unreadable data file %s", path)
+
+
 def _load() -> dict:
     if not os.path.exists(DB_PATH):
-        return {"admins": [], "files": {}, "users": {}, "history": {}, "settings": {}}
-    with open(DB_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return _default_data()
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        logger.exception("bot_data.json is unreadable; starting from defaults")
+        _quarantine(DB_PATH)
+        return _default_data()
+    if not isinstance(data, dict):
+        logger.error("bot_data.json has unexpected type %s; starting from defaults", type(data).__name__)
+        _quarantine(DB_PATH)
+        return _default_data()
+    # Back-fill missing top-level keys so callers never hit a KeyError on an
+    # older/partially-written file.
+    for key, value in _default_data().items():
+        data.setdefault(key, value)
+    if not isinstance(data.get("files"), dict):
+        data["files"] = {}
+    if not isinstance(data.get("settings"), dict):
+        data["settings"] = {}
+    return data
 
 
 def _save(data: dict) -> None:
     tmp = DB_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, DB_PATH)
 
 
@@ -150,27 +187,31 @@ def get_history(user_id: int, limit: int = 50) -> list[dict]:
 # }
 
 
-def _url_key(url: str) -> str:
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
+def _url_key(url: str, user_id: int | None = None) -> str:
+    """Cache key. When user_id is given the entry is scoped to that user, so a
+    cached file is only ever re-sent to the person who originally requested it."""
+    material = url if user_id is None else f"{user_id}\n{url}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
-def find_file(url: str) -> dict | None:
+def find_file(url: str, user_id: int | None = None) -> dict | None:
     with LOCK:
         data = _load()
-        rec = data["files"].get(_url_key(url))
+        rec = data.get("files", {}).get(_url_key(url, user_id))
         if not rec:
             return None
         rec = dict(rec)
     return rec
 
 
-def touch_file(url: str) -> dict:
-    key = _url_key(url)
+def touch_file(url: str, user_id: int | None = None) -> dict:
+    key = _url_key(url, user_id)
     with LOCK:
         data = _load()
-        rec = data["files"].setdefault(
+        files = data.setdefault("files", {})
+        rec = files.setdefault(
             key,
-            {"url": url, "name": "", "size": 0, "last_request": 0, "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID},
+            {"url": url, "user_id": user_id, "name": "", "size": 0, "last_request": 0, "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID},
         )
         rec["last_request"] = int(time.time())
         rec["requests"] = rec.get("requests", 0) + 1
@@ -178,14 +219,36 @@ def touch_file(url: str) -> dict:
         return dict(rec)
 
 
-def set_file_parts(url: str, name: str, size: int, parts: list[dict]) -> dict:
-    key = _url_key(url)
+def set_file_parts(url: str, name: str, size: int, parts: list[dict], user_id: int | None = None) -> dict:
+    key = _url_key(url, user_id)
     with LOCK:
         data = _load()
-        rec = data["files"].setdefault(key, {"url": url, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
+        rec = data.setdefault("files", {}).setdefault(key, {"url": url, "user_id": user_id, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
         rec["name"] = name
         rec["size"] = size
         rec["parts"] = parts
         rec["channel_chat_id"] = config.CHANNEL_ID
         _save(data)
         return dict(rec)
+
+
+def prune_files(ttl_days: int) -> int:
+    """Drop cache-index entries older than ttl_days. Returns the number removed.
+
+    Only the local index is trimmed; the channel messages themselves are left
+    in place so active re-sends keep working.
+    """
+    cutoff = time.time() - max(0, ttl_days) * 86400
+    with LOCK:
+        data = _load()
+        files = data.setdefault("files", {})
+        stale = [
+            key
+            for key, rec in files.items()
+            if isinstance(rec, dict) and rec.get("last_request", 0) < cutoff
+        ]
+        for key in stale:
+            files.pop(key, None)
+        if stale:
+            _save(data)
+    return len(stale)

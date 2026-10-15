@@ -293,6 +293,9 @@ TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS=10
 
+# Maximum number of downloads one user may run at once (0 = unlimited)
+MAX_CONCURRENT_DOWNLOADS=3
+
 # Channel cache lifetime for re-sending the same link (days)
 CACHE_TTL_DAYS=7
 
@@ -321,6 +324,9 @@ KOUTUBE_BASE_URL=${KOUTUBE_BASE_URL}
 # Cobalt tunnels media through its own server — YouTube never sees your IP.
 # Empty disables cobalt.
 COBALT_API_URL=${COBALT_API_URL}
+
+# dlapi downloader service base URL (server-side direct links).
+DLAPI_BASE_URL=https://dlapi.yebekhe.workers.dev
 EOF
 chmod 600 "${ENV_FILE}"
 info ".env written"

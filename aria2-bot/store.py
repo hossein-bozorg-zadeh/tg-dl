@@ -1,41 +1,86 @@
 import json
+import logging
 import os
 import secrets
+import shutil
 import threading
 import time
-import uuid
 from pathlib import Path
 
 import config
 
+logger = logging.getLogger("aria2bot.store")
+
 LOCK = threading.Lock()
 STORE_PATH = os.path.join(config.BASE_DIR, "requests.json")
+REQUEST_TTL_SECONDS = 3600
+
+
+def _default_data() -> dict:
+    return {"requests": {}, "workdirs": {}, "thumbnails": {}, "last_seen": {}}
+
+
+def _quarantine(path: str) -> None:
+    """Move an unreadable data file aside so the bot can keep running."""
+    try:
+        broken = f"{path}.corrupt-{int(time.time())}"
+        os.replace(path, broken)
+        logger.error("Moved unreadable data file to %s", broken)
+    except OSError:
+        logger.exception("Could not quarantine unreadable data file %s", path)
 
 
 def _load() -> dict:
     if not os.path.exists(STORE_PATH):
-        return {"requests": {}, "thumbnails": {}, "last_seen": {}}
-    with open(STORE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return _default_data()
+    try:
+        with open(STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        logger.exception("requests.json is unreadable; starting from defaults")
+        _quarantine(STORE_PATH)
+        return _default_data()
+    if not isinstance(data, dict):
+        logger.error("requests.json has unexpected type %s; starting from defaults", type(data).__name__)
+        _quarantine(STORE_PATH)
+        return _default_data()
+    for key, value in _default_data().items():
+        data.setdefault(key, value)
+    if not isinstance(data.get("requests"), dict):
+        data["requests"] = {}
+    if not isinstance(data.get("workdirs"), dict):
+        data["workdirs"] = {}
+    return data
 
 
 def _save(data: dict) -> None:
     tmp = STORE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, STORE_PATH)
 
 
 def _cleanup_old_requests(data: dict) -> None:
+    """Drop expired format-selection requests and their temp directories.
+
+    Work directories live in their own top-level key (never inside
+    "requests"), so they cannot be mistaken for request records.
+    """
     now = time.time()
+    requests = data.setdefault("requests", {})
+    workdirs = data.setdefault("workdirs", {})
     stale = [
-        token for token, rec in data["requests"].items()
-        if now - rec.get("created_at", 0) > 3600
+        token
+        for token, rec in requests.items()
+        if isinstance(rec, dict) and now - rec.get("created_at", now) > REQUEST_TTL_SECONDS
     ]
     for token in stale:
-        del data["requests"][token]
-        work = data["requests"].get("_workdirs", {})
-        data["requests"].setdefault("_workdirs", {}).pop(token, None)
+        requests.pop(token, None)
+        path = workdirs.pop(token, None)
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 # --- Request store (format selection flow) -------------------------------
@@ -66,7 +111,7 @@ def create_request(request_type: str, parsed, options: list[dict], info: dict | 
 def load_request(token: str) -> dict | None:
     with LOCK:
         data = _load()
-        rec = data["requests"].get(token)
+        rec = data.get("requests", {}).get(token)
         return dict(rec) if rec else None
 
 
@@ -74,13 +119,19 @@ def delete_request(token: str) -> None:
     with LOCK:
         data = _load()
         data.setdefault("requests", {}).pop(token, None)
-        data.setdefault("requests", {}).setdefault("_workdirs", {}).pop(token, None)
+        path = data.setdefault("workdirs", {}).pop(token, None)
         _save(data)
+    if path:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def work_directory(token: str) -> Path:
     path = Path(config.DOWNLOAD_DIR) / f"req_{token}"
     path.mkdir(parents=True, exist_ok=True)
+    with LOCK:
+        data = _load()
+        data.setdefault("workdirs", {})[token] = str(path)
+        _save(data)
     return path
 
 
@@ -133,3 +184,30 @@ def cooldown_check(user_id: int, timeout_seconds: int = 10) -> int:
 def db_admins() -> list[int]:
     import db
     return db.get_admins()
+
+
+# --- Per-user download concurrency guard ----------------------------------
+
+_active_downloads: dict[int, int] = {}
+_active_lock = threading.Lock()
+
+
+def acquire_download(user_id: int, limit: int) -> bool:
+    """Reserve a download slot for a user. Returns False when at the limit."""
+    if limit <= 0:
+        return True
+    with _active_lock:
+        current = _active_downloads.get(user_id, 0)
+        if current >= limit:
+            return False
+        _active_downloads[user_id] = current + 1
+        return True
+
+
+def release_download(user_id: int) -> None:
+    with _active_lock:
+        current = _active_downloads.get(user_id, 0) - 1
+        if current <= 0:
+            _active_downloads.pop(user_id, None)
+        else:
+            _active_downloads[user_id] = current

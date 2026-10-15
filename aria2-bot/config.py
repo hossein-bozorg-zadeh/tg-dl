@@ -200,9 +200,6 @@ TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "")
 MAX_BOTAPI_SIZE: int = 49 * 1024 * 1024  # 49 MiB
 MAX_MT_PROTO_SIZE: int = 2 * 1024 * 1024 * 1024  # 2 GiB
 
-# Direct-download chunk size (bytes). Values <1024 treated as KiB for back-compat.
-CHUNK_SIZE: int = (lambda v: v * 1024 if v < 1024 else v)(int(os.getenv("CHUNK_SIZE", "128") or 128))
-
 # Proxy for network requests + yt-dlp (optional)
 HTTP_PROXY: str = os.getenv("HTTP_PROXY", "").strip()
 
@@ -229,8 +226,15 @@ KOUTUBE_BASE_URL: str = os.getenv("KOUTUBE_BASE_URL", "").strip().rstrip("/")
 # The public api.cobalt.tools is bot-protected — self-host via docker compose.
 COBALT_API_URL: str = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
 
+# Base URL of the dlapi downloader service (self-run; gives direct links so the
+# bot never talks to YouTube directly). Override if you host it elsewhere.
+DLAPI_BASE_URL: str = os.getenv("DLAPI_BASE_URL", "https://dlapi.yebekhe.workers.dev").strip().rstrip("/")
+
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
+
+# Maximum number of downloads a single user may run at once (0 = unlimited).
+MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 
 # Timeout for external tools (yt-dlp etc.)
 PROCESS_MAX_TIMEOUT: int = int(os.getenv("PROCESS_MAX_TIMEOUT", "3700"))
