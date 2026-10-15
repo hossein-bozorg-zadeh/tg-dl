@@ -1180,8 +1180,10 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
     except Exception:
         pass
 
-    # Files above the Telegram size cap are split into parts and uploaded as documents.
-    if size <= config.MAX_MT_PROTO_SIZE:
+    # Files above the split threshold (capped by the Telegram size limit) are
+    # split into parts and uploaded as documents.
+    split_limit = min(config.SPLIT_THRESHOLD, config.MAX_MT_PROTO_SIZE)
+    if size <= split_limit:
         parts = [path]
     else:
         try:
@@ -1313,7 +1315,7 @@ async def upload_to_channel(path: str, name: str, progress_cb=None) -> int:
 # Status / control commands
 # --------------------------------------------------------------------------
 
-@dp.message(Command("list"))
+@dp.message(Command("list"), StateFilter(None))
 @guard
 async def cmd_list(message: Message):
     try:
@@ -1329,7 +1331,7 @@ async def cmd_list(message: Message):
     await message.answer(f"<pre>{html.escape(text)}</pre>")
 
 
-@dp.message(Command("status"))
+@dp.message(Command("status"), StateFilter(None))
 @guard
 async def cmd_status(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1345,7 +1347,7 @@ async def cmd_status(message: Message):
     await message.answer(f"<pre>{html.escape(Aria2Client.format_status(st))}</pre>")
 
 
-@dp.message(Command("pause"))
+@dp.message(Command("pause"), StateFilter(None))
 @guard
 async def cmd_pause(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1359,7 +1361,7 @@ async def cmd_pause(message: Message):
         await message.answer(f"❌ {e}")
 
 
-@dp.message(Command("resume"))
+@dp.message(Command("resume"), StateFilter(None))
 @guard
 async def cmd_resume(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1373,7 +1375,7 @@ async def cmd_resume(message: Message):
         await message.answer(f"❌ {e}")
 
 
-@dp.message(Command("cancel"))
+@dp.message(Command("cancel"), StateFilter(None))
 @guard
 async def cmd_cancel(message: Message):
     gid = (message.text.split() + [""])[1]
@@ -1529,6 +1531,10 @@ async def on_del_cb(cb: CallbackQuery):
 @guard_owner
 async def admin_add_user(message: Message, state: FSMContext):
     text = (message.text or "").strip()
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Add-user cancelled.", reply_markup=admin_panel_kb())
+        return
     ids = re.split(r"[\s,;]+", text)
     ids = [i for i in ids if i.isdigit()]
     if not ids:
