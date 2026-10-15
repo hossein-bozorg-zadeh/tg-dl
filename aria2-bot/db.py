@@ -187,28 +187,31 @@ def get_history(user_id: int, limit: int = 50) -> list[dict]:
 # }
 
 
-def _url_key(url: str) -> str:
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
+def _url_key(url: str, user_id: int | None = None) -> str:
+    """Cache key. When user_id is given the entry is scoped to that user, so a
+    cached file is only ever re-sent to the person who originally requested it."""
+    material = url if user_id is None else f"{user_id}\n{url}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
-def find_file(url: str) -> dict | None:
+def find_file(url: str, user_id: int | None = None) -> dict | None:
     with LOCK:
         data = _load()
-        rec = data.get("files", {}).get(_url_key(url))
+        rec = data.get("files", {}).get(_url_key(url, user_id))
         if not rec:
             return None
         rec = dict(rec)
     return rec
 
 
-def touch_file(url: str) -> dict:
-    key = _url_key(url)
+def touch_file(url: str, user_id: int | None = None) -> dict:
+    key = _url_key(url, user_id)
     with LOCK:
         data = _load()
         files = data.setdefault("files", {})
         rec = files.setdefault(
             key,
-            {"url": url, "name": "", "size": 0, "last_request": 0, "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID},
+            {"url": url, "user_id": user_id, "name": "", "size": 0, "last_request": 0, "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID},
         )
         rec["last_request"] = int(time.time())
         rec["requests"] = rec.get("requests", 0) + 1
@@ -216,11 +219,11 @@ def touch_file(url: str) -> dict:
         return dict(rec)
 
 
-def set_file_parts(url: str, name: str, size: int, parts: list[dict]) -> dict:
-    key = _url_key(url)
+def set_file_parts(url: str, name: str, size: int, parts: list[dict], user_id: int | None = None) -> dict:
+    key = _url_key(url, user_id)
     with LOCK:
         data = _load()
-        rec = data.setdefault("files", {}).setdefault(key, {"url": url, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
+        rec = data.setdefault("files", {}).setdefault(key, {"url": url, "user_id": user_id, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
         rec["name"] = name
         rec["size"] = size
         rec["parts"] = parts

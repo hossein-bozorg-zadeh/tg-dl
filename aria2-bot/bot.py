@@ -342,7 +342,7 @@ async def on_history_cb(cb: CallbackQuery):
         await cb.answer("That history item is no longer available.", show_alert=True)
         return
     item = entries[index]
-    cached = db.find_file(item.get("url", ""))
+    cached = db.find_file(item.get("url", ""), cb.from_user.id)
     if cached and cached.get("parts") and await resend_cached(cached, cb.message.chat.id):
         db.add_history(cb.from_user.id, item.get("url", ""), item.get("name", "cached file"), item.get("size", 0), "cached")
         await cb.answer("Sent from cache.")
@@ -718,16 +718,16 @@ async def process_link(message: Message, raw_text: str, user_id: int | None = No
     logger.info("Incoming link | user=%s chat=%s kind=%s url=%s", uid, chat_id, kind, url[:120])
 
     # 7-day cache: same link requested within CACHE_TTL_DAYS is re-sent from the channel
-    cached = db.find_file(url)
+    cached = db.find_file(url, uid)
     if cached and cached.get("parts"):
         age = time.time() - cached.get("last_request", 0)
         if age < config.CACHE_TTL_DAYS * 86400:
-            db.touch_file(url)
+            db.touch_file(url, uid)
             await message.answer("♻️ <b>Already downloaded</b> — resending from cache...")
             if await resend_cached(cached, chat_id):
                 db.add_history(uid, url, cached.get("name") or "cached file", cached.get("size", 0), "cached")
                 return
-    db.touch_file(url)
+    db.touch_file(url, uid)
 
     # YouTube / yt-dlp quick flow
     if parsing.is_probable_youtube_url(url):
@@ -1209,7 +1209,7 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
             except Exception as e:
                 logger.error("channel upload failed: %s", e)
         if stored_parts:
-            db.set_file_parts(cache_key, name, size, stored_parts)
+            db.set_file_parts(cache_key, name, size, stored_parts, user_id)
             log_rec = (
                 f"📄 <b>New download</b>\n"
                 f"File: <b>{name}</b>\nSize: {_fmt_size(size)}"
