@@ -324,6 +324,9 @@ KOUTUBE_BASE_URL=${KOUTUBE_BASE_URL}
 # Cobalt tunnels media through its own server — YouTube never sees your IP.
 # Empty disables cobalt.
 COBALT_API_URL=${COBALT_API_URL}
+
+# dlapi downloader service base URL (server-side direct links).
+DLAPI_BASE_URL=https://dlapi.yebekhe.workers.dev
 EOF
 chmod 600 "${ENV_FILE}"
 info ".env written"

@@ -229,6 +229,10 @@ KOUTUBE_BASE_URL: str = os.getenv("KOUTUBE_BASE_URL", "").strip().rstrip("/")
 # The public api.cobalt.tools is bot-protected — self-host via docker compose.
 COBALT_API_URL: str = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
 
+# Base URL of the dlapi downloader service (self-run; gives direct links so the
+# bot never talks to YouTube directly). Override if you host it elsewhere.
+DLAPI_BASE_URL: str = os.getenv("DLAPI_BASE_URL", "https://dlapi.yebekhe.workers.dev").strip().rstrip("/")
+
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
 

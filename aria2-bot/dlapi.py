@@ -12,9 +12,9 @@ import json
 import logging
 import re
 
-logger = logging.getLogger("aria2bot.dlapi")
+import config
 
-BASE_URL = "https://dlapi.yebekhe.workers.dev"
+logger = logging.getLogger("aria2bot.dlapi")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".opus", ".weba"}
@@ -25,7 +25,7 @@ async def _get(path: str, params: dict, timeout: float = 30.0) -> dict:
     from urllib.request import Request, urlopen
 
     query = urllib.parse.urlencode(params)
-    url = f"{BASE_URL}{path}?{query}"
+    url = f"{config.DLAPI_BASE_URL}{path}?{query}"
     loop = asyncio.get_event_loop()
 
     def fetch():
