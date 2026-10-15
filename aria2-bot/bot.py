@@ -11,6 +11,7 @@ import shutil
 import time
 import zipfile
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -41,7 +42,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(os.path.join(config.BASE_DIR, "bot.log")),
+        RotatingFileHandler(
+            os.path.join(config.BASE_DIR, "bot.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
     ],
 )
 logger = logging.getLogger("aria2bot")
@@ -457,6 +463,12 @@ async def backup_scheduler() -> None:
             await send_backup()
         except Exception:
             logger.exception("Daily backup failed")
+        try:
+            removed = db.prune_files(config.CACHE_TTL_DAYS)
+            if removed:
+                logger.info("Pruned %s expired cache entries", removed)
+        except Exception:
+            logger.exception("Cache pruning failed")
 
 
 @dp.message(Command("about"))
@@ -1602,6 +1614,12 @@ async def main():
             logger.warning("Could not access channel %s: %s. Add the bot as channel admin!", config.CHANNEL_ID, e)
     await init_mtproto()
     await restore_latest_backup()
+    try:
+        removed = db.prune_files(config.CACHE_TTL_DAYS)
+        if removed:
+            logger.info("Pruned %s expired cache entries", removed)
+    except Exception:
+        logger.exception("Cache pruning failed")
     backup_task = asyncio.create_task(backup_scheduler())
     logger.info("Starting bot polling...")
     try:

@@ -230,3 +230,25 @@ def set_file_parts(url: str, name: str, size: int, parts: list[dict], user_id: i
         rec["channel_chat_id"] = config.CHANNEL_ID
         _save(data)
         return dict(rec)
+
+
+def prune_files(ttl_days: int) -> int:
+    """Drop cache-index entries older than ttl_days. Returns the number removed.
+
+    Only the local index is trimmed; the channel messages themselves are left
+    in place so active re-sends keep working.
+    """
+    cutoff = time.time() - max(0, ttl_days) * 86400
+    with LOCK:
+        data = _load()
+        files = data.setdefault("files", {})
+        stale = [
+            key
+            for key, rec in files.items()
+            if isinstance(rec, dict) and rec.get("last_request", 0) < cutoff
+        ]
+        for key in stale:
+            files.pop(key, None)
+        if stale:
+            _save(data)
+    return len(stale)
