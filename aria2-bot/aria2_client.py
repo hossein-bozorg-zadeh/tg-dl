@@ -1,9 +1,15 @@
+import asyncio
+from typing import Any
+
 import aiohttp
 
 import config
 
 GIB = 1024 * 1024 * 1024
 MIB = 1024 * 1024
+
+# aria2 RPC calls should be quick; a stuck socket must not hang a handler.
+RPC_TIMEOUT = aiohttp.ClientTimeout(total=30, sock_connect=10)
 
 
 def _fmt_size(num: float) -> str:
@@ -40,12 +46,27 @@ STATUS_LABELS = {
 
 
 class Aria2Client:
-    def __init__(self, url: str, secret: str):
+    def __init__(self, url: str, secret: str, timeout: aiohttp.ClientTimeout = RPC_TIMEOUT):
         self.url = url
         self.secret = secret
+        self.timeout = timeout
         self._rpc_id = 0
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
 
-    async def call(self, method: str, *params) -> any:
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            async with self._session_lock:
+                if self._session is None or self._session.closed:
+                    self._session = aiohttp.ClientSession(timeout=self.timeout)
+        return self._session
+
+    async def close(self) -> None:
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
+
+    async def call(self, method: str, *params) -> Any:
         self._rpc_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -53,11 +74,18 @@ class Aria2Client:
             "method": method,
             "params": [f"token:{self.secret}", *params],
         }
-        async with aiohttp.ClientSession() as session:
+        session = await self._get_session()
+        try:
             async with session.post(self.url, json=payload) as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise RuntimeError(f"aria2 RPC unreachable: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"aria2 RPC returned an unexpected payload: {data!r}")
         if "error" in data:
-            raise RuntimeError(data["error"].get("message", str(data["error"])))
+            error = data["error"]
+            message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            raise RuntimeError(message)
         return data.get("result")
 
     async def add_uri(self, uris: list[str], options: dict | None = None) -> str:

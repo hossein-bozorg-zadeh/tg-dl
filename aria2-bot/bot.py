@@ -1589,6 +1589,10 @@ async def main():
     finally:
         backup_task.cancel()
         await asyncio.gather(backup_task, return_exceptions=True)
+        await aria2.close()
+        if mtproto is not None:
+            await mtproto.disconnect()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
