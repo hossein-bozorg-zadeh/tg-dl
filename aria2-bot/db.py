@@ -1,26 +1,63 @@
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
 
 import config
 
+logger = logging.getLogger("aria2bot.db")
+
 DB_PATH = os.path.join(config.BASE_DIR, "bot_data.json")
 LOCK = threading.Lock()
 
 
+def _default_data() -> dict:
+    return {"admins": [], "files": {}, "users": {}, "history": {}, "settings": {}}
+
+
+def _quarantine(path: str) -> None:
+    """Move an unreadable data file aside so the bot can keep running."""
+    try:
+        broken = f"{path}.corrupt-{int(time.time())}"
+        os.replace(path, broken)
+        logger.error("Moved unreadable data file to %s", broken)
+    except OSError:
+        logger.exception("Could not quarantine unreadable data file %s", path)
+
+
 def _load() -> dict:
     if not os.path.exists(DB_PATH):
-        return {"admins": [], "files": {}, "users": {}, "history": {}, "settings": {}}
-    with open(DB_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return _default_data()
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        logger.exception("bot_data.json is unreadable; starting from defaults")
+        _quarantine(DB_PATH)
+        return _default_data()
+    if not isinstance(data, dict):
+        logger.error("bot_data.json has unexpected type %s; starting from defaults", type(data).__name__)
+        _quarantine(DB_PATH)
+        return _default_data()
+    # Back-fill missing top-level keys so callers never hit a KeyError on an
+    # older/partially-written file.
+    for key, value in _default_data().items():
+        data.setdefault(key, value)
+    if not isinstance(data.get("files"), dict):
+        data["files"] = {}
+    if not isinstance(data.get("settings"), dict):
+        data["settings"] = {}
+    return data
 
 
 def _save(data: dict) -> None:
     tmp = DB_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, DB_PATH)
 
 
@@ -157,7 +194,7 @@ def _url_key(url: str) -> str:
 def find_file(url: str) -> dict | None:
     with LOCK:
         data = _load()
-        rec = data["files"].get(_url_key(url))
+        rec = data.get("files", {}).get(_url_key(url))
         if not rec:
             return None
         rec = dict(rec)
@@ -168,7 +205,8 @@ def touch_file(url: str) -> dict:
     key = _url_key(url)
     with LOCK:
         data = _load()
-        rec = data["files"].setdefault(
+        files = data.setdefault("files", {})
+        rec = files.setdefault(
             key,
             {"url": url, "name": "", "size": 0, "last_request": 0, "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID},
         )
@@ -182,7 +220,7 @@ def set_file_parts(url: str, name: str, size: int, parts: list[dict]) -> dict:
     key = _url_key(url)
     with LOCK:
         data = _load()
-        rec = data["files"].setdefault(key, {"url": url, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
+        rec = data.setdefault("files", {}).setdefault(key, {"url": url, "last_request": int(time.time()), "requests": 0, "parts": [], "channel_chat_id": config.CHANNEL_ID})
         rec["name"] = name
         rec["size"] = size
         rec["parts"] = parts
