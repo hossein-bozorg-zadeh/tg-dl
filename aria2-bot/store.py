@@ -184,3 +184,30 @@ def cooldown_check(user_id: int, timeout_seconds: int = 10) -> int:
 def db_admins() -> list[int]:
     import db
     return db.get_admins()
+
+
+# --- Per-user download concurrency guard ----------------------------------
+
+_active_downloads: dict[int, int] = {}
+_active_lock = threading.Lock()
+
+
+def acquire_download(user_id: int, limit: int) -> bool:
+    """Reserve a download slot for a user. Returns False when at the limit."""
+    if limit <= 0:
+        return True
+    with _active_lock:
+        current = _active_downloads.get(user_id, 0)
+        if current >= limit:
+            return False
+        _active_downloads[user_id] = current + 1
+        return True
+
+
+def release_download(user_id: int) -> None:
+    with _active_lock:
+        current = _active_downloads.get(user_id, 0) - 1
+        if current <= 0:
+            _active_downloads.pop(user_id, None)
+        else:
+            _active_downloads[user_id] = current

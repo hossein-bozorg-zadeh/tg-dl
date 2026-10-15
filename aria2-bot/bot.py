@@ -866,6 +866,12 @@ async def on_request_cb(cb: CallbackQuery):
         username=rec["parsed"].get("username"),
         password=rec["parsed"].get("password"),
     )
+    if not store.acquire_download(cb.from_user.id, config.MAX_CONCURRENT_DOWNLOADS):
+        await cb.answer(
+            "⏳ You already have the maximum number of downloads running. Wait for one to finish.",
+            show_alert=True,
+        )
+        return
     work_dir = store.work_directory(token)
     status_msg = cb.message
 
@@ -893,6 +899,7 @@ async def on_request_cb(cb: CallbackQuery):
         except Exception:
             pass
     finally:
+        store.release_download(cb.from_user.id)
         store.delete_request(token)
         shutil.rmtree(work_dir, ignore_errors=True)
         await cb.answer()

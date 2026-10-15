@@ -232,5 +232,8 @@ COBALT_API_URL: str = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS: int = int(os.getenv("COOLDOWN_SECONDS", "10"))
 
+# Maximum number of downloads a single user may run at once (0 = unlimited).
+MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+
 # Timeout for external tools (yt-dlp etc.)
 PROCESS_MAX_TIMEOUT: int = int(os.getenv("PROCESS_MAX_TIMEOUT", "3700"))

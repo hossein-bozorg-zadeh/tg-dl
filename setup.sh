@@ -293,6 +293,9 @@ TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
 # Cooldown between requests for non-authorized users (seconds)
 COOLDOWN_SECONDS=10
 
+# Maximum number of downloads one user may run at once (0 = unlimited)
+MAX_CONCURRENT_DOWNLOADS=3
+
 # Channel cache lifetime for re-sending the same link (days)
 CACHE_TTL_DAYS=7
 
