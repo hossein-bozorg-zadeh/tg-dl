@@ -7,7 +7,13 @@ import random
 from pathlib import Path
 from urllib.parse import urlparse
 
+import config
+
 logger = logging.getLogger("aria2bot.ytdlp")
+
+
+def _process_timeout() -> float:
+    return float(getattr(config, "PROCESS_MAX_TIMEOUT", 3700) or 3700)
 
 VIDEO_EXTENSIONS = {"mp4", "mkv", "webm", "mov", "avi", "flv"}
 AUDIO_EXTENSIONS = {"mp3", "m4a", "aac", "wav", "flac", "opus", "weba"}
@@ -48,6 +54,15 @@ def _command_base(parsed_input, settings, use_cookies: bool = True) -> list[str]
     return command
 
 
+async def _kill(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    await process.wait()
+
+
 async def _run_command(command: list[str], cwd: Path | None = None) -> tuple[str, str]:
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -55,11 +70,20 @@ async def _run_command(command: list[str], cwd: Path | None = None) -> tuple[str
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    timeout = _process_timeout()
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _kill(process)
+        raise RuntimeError(f"yt-dlp timed out after {int(timeout)}s")
     if process.returncode != 0:
-        error_text = stderr.decode().strip() or stdout.decode().strip() or "yt-dlp failed"
+        error_text = (
+            stderr.decode(errors="replace").strip()
+            or stdout.decode(errors="replace").strip()
+            or "yt-dlp failed"
+        )
         raise RuntimeError(error_text)
-    return stdout.decode().strip(), stderr.decode().strip()
+    return stdout.decode(errors="replace").strip(), stderr.decode(errors="replace").strip()
 
 
 async def _run_command_with_progress(command: list[str], cwd: Path | None, progress_cb=None) -> None:
@@ -72,29 +96,39 @@ async def _run_command_with_progress(command: list[str], cwd: Path | None, progr
     assert process.stdout is not None
     last_pct = -1
     error_lines: list[str] = []
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        text = line.decode(errors="replace").strip()
-        if not text:
-            continue
-        if text.startswith("ERROR"):
-            error_lines.append(text)
-        # Skip informational lines (they start with "[" or contain no percent).
-        if text.startswith("[") or "%|" not in text:
-            continue
-        # yt-dlp --newline --progress-template output like: " 45.6%| 2.1MiB/s"
-        try:
-            pct_str = text.split("%")[0].strip()
-            pct = float(pct_str)
-            speed = text.split("|")[1].strip() if "|" in text else ""
-            if pct - last_pct >= 0.5:
-                last_pct = pct
-                if progress_cb:
-                    await progress_cb(pct, speed)
-        except (ValueError, IndexError):
-            continue
+
+    async def consume() -> None:
+        nonlocal last_pct
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            if text.startswith("ERROR"):
+                error_lines.append(text)
+            # Skip informational lines (they start with "[" or contain no percent).
+            if text.startswith("[") or "%|" not in text:
+                continue
+            # yt-dlp --newline --progress-template output like: " 45.6%| 2.1MiB/s"
+            try:
+                pct_str = text.split("%")[0].strip()
+                pct = float(pct_str)
+                speed = text.split("|")[1].strip() if "|" in text else ""
+                if pct - last_pct >= 0.5:
+                    last_pct = pct
+                    if progress_cb:
+                        await progress_cb(pct, speed)
+            except (ValueError, IndexError):
+                continue
+
+    timeout = _process_timeout()
+    try:
+        await asyncio.wait_for(consume(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _kill(process)
+        raise RuntimeError(f"yt-dlp timed out after {int(timeout)}s")
     code = await process.wait()
     if code != 0:
         detail = " | ".join(error_lines[-3:]) if error_lines else f"exit code {code}"
