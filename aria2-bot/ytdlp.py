@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import random
@@ -309,8 +310,10 @@ def _caption_from_info(info: dict, fallback: str) -> str:
     title = info.get("title")
     webpage = info.get("webpage_url")
     if title and webpage:
-        return f'<b><a href="{webpage}">{title}</a></b>'
-    return title or fallback
+        return f'<b><a href="{html.escape(str(webpage), quote=True)}">{html.escape(str(title))}</a></b>'
+    if title:
+        return html.escape(str(title))
+    return html.escape(str(fallback))
 
 
 def _is_bot_detected(error: Exception) -> bool:

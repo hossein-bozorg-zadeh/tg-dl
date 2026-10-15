@@ -575,7 +575,7 @@ async def show_downloads(message: Message, action: str):
     rows.append([btn("🏠 Back", "menu:home", "secondary")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     try:
-        await message.edit_text(f"<pre>{text}</pre>", reply_markup=kb)
+        await message.edit_text(f"<pre>{html.escape(text)}</pre>", reply_markup=kb)
     except Exception:
         pass
 
@@ -883,7 +883,7 @@ async def on_request_cb(cb: CallbackQuery):
     except Exception as exc:
         logger.exception("Request action failed | token=%s option=%s", token, option_id)
         try:
-            await status_msg.edit_text(f"{'❌ I could not process that link.'}\n<code>{exc}</code>")
+            await status_msg.edit_text(f"{'❌ I could not process that link.'}\n<code>{html.escape(str(exc))}</code>")
         except Exception:
             pass
     finally:
@@ -955,7 +955,7 @@ async def direct_download(parsed, option, settings, work_dir, info=None, status_
             path = files[0] if files else None
             if not path:
                 raise RuntimeError("No file after download")
-        return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": parsed.custom_file_name or os.path.basename(path)}
+        return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
     # Default aria2 path (no custom name)
     gid, _ = await downloaders.download_with_aria2(aria2, url, str(work_dir))
@@ -979,7 +979,7 @@ async def direct_download(parsed, option, settings, work_dir, info=None, status_
     if not files:
         raise RuntimeError("No file after download")
     path = files[0]
-    return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": parsed.custom_file_name or os.path.basename(path)}
+    return {"path": path, "file_name": os.path.basename(path), "send_type": option.get("send_type", "document"), "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
 
 async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
@@ -1024,7 +1024,7 @@ async def dlapi_download(parsed, option, settings, work_dir, status_msg=None):
         send_type = "audio"
     elif ext and ext.lower() in ("mp4", "mkv", "webm", "mov", "avi", "flv"):
         send_type = "video"
-    return {"path": path, "file_name": os.path.basename(path), "send_type": send_type, "caption": parsed.custom_file_name or os.path.basename(path)}
+    return {"path": path, "file_name": os.path.basename(path), "send_type": send_type, "caption": html.escape(parsed.custom_file_name or os.path.basename(path))}
 
 
 async def mega_download(parsed, option, settings, work_dir, status_msg=None):
@@ -1057,7 +1057,7 @@ async def mega_download(parsed, option, settings, work_dir, status_msg=None):
         "path": path,
         "file_name": out_name,
         "send_type": "document",
-        "caption": out_name,
+        "caption": html.escape(out_name),
         "_url": parsed.source_url,
     }
 
@@ -1105,7 +1105,7 @@ async def mediafire_download(parsed, option, settings, work_dir, status_msg=None
         "path": path,
         "file_name": out_name,
         "send_type": "document",
-        "caption": out_name,
+        "caption": html.escape(out_name),
         "_url": parsed.source_url,
     }
 
@@ -1189,7 +1189,7 @@ async def upload_artifact(chat_id: int, user_id: int, artifact: dict, status_msg
         except Exception as e:
             logger.error("split failed: %s", e)
             await status_msg.edit_text(
-                f"⚠️ <b>{name}</b> ({_fmt_size(size)}) is too large for Telegram and splitting failed.\nFile kept on server.\n<code>{path}</code>",
+                f"⚠️ <b>{html.escape(name)}</b> ({_fmt_size(size)}) is too large for Telegram and splitting failed.\nFile kept on server.\n<code>{html.escape(str(path))}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1275,6 +1275,7 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
             chat_id,
             path,
             caption=caption,
+            parse_mode="html",
             force_document=(send_type == "document"),
             attributes=[DocumentAttributeFilename(file_name=name)],
             part_size_kib=1024,
@@ -1284,7 +1285,7 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
         return
 
     await status_msg.edit_text(
-        f"⚠️ <b>{name}</b> ({_fmt_size(size)}) is too large for Telegram.\nFile kept on server.\n<code>{path}</code>",
+        f"⚠️ <b>{html.escape(name)}</b> ({_fmt_size(size)}) is too large for Telegram.\nFile kept on server.\n<code>{html.escape(str(path))}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1325,7 +1326,7 @@ async def cmd_list(message: Message):
         return
     from aria2_client import Aria2Client
     text = "\n\n".join(Aria2Client.format_status(it) for it in items[:6])
-    await message.answer(f"<pre>{text}</pre>")
+    await message.answer(f"<pre>{html.escape(text)}</pre>")
 
 
 @dp.message(Command("status"))
@@ -1341,7 +1342,7 @@ async def cmd_status(message: Message):
     except RuntimeError as e:
         await message.answer(f"❌ {e}")
         return
-    await message.answer(f"<pre>{Aria2Client.format_status(st)}</pre>")
+    await message.answer(f"<pre>{html.escape(Aria2Client.format_status(st))}</pre>")
 
 
 @dp.message(Command("pause"))
