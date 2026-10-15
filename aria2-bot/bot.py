@@ -30,6 +30,7 @@ import dlapi
 import downloaders
 import koutube
 import media
+import netguard
 import parsing
 import store
 import ytdlp
@@ -716,6 +717,11 @@ async def process_link(message: Message, raw_text: str, user_id: int | None = No
     url = parsed.source_url
     kind = downloaders.detect(url)
     logger.info("Incoming link | user=%s chat=%s kind=%s url=%s", uid, chat_id, kind, url[:120])
+
+    # SSRF guard: enforced only in public mode (the private set is trusted).
+    if db.get_access_mode() == "public" and not await netguard.is_safe_url(url):
+        await message.answer("⛔ That link points to a private or internal address and is not allowed.")
+        return
 
     # 7-day cache: same link requested within CACHE_TTL_DAYS is re-sent from the channel
     cached = db.find_file(url, uid)
