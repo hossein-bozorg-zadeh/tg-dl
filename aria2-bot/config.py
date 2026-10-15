@@ -200,9 +200,6 @@ TELEGRAM_API_HASH: str = os.getenv("TELEGRAM_API_HASH", "")
 MAX_BOTAPI_SIZE: int = 49 * 1024 * 1024  # 49 MiB
 MAX_MT_PROTO_SIZE: int = 2 * 1024 * 1024 * 1024  # 2 GiB
 
-# Direct-download chunk size (bytes). Values <1024 treated as KiB for back-compat.
-CHUNK_SIZE: int = (lambda v: v * 1024 if v < 1024 else v)(int(os.getenv("CHUNK_SIZE", "128") or 128))
-
 # Proxy for network requests + yt-dlp (optional)
 HTTP_PROXY: str = os.getenv("HTTP_PROXY", "").strip()
 

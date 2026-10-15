@@ -156,13 +156,33 @@ def _option_id(prefix: str, index: int) -> str:
     return f"{prefix}{index}"
 
 
+def _parse_probe_json(stdout: str) -> dict:
+    """Parse `yt-dlp --dump-single-json` output, tolerating leading log lines."""
+    text = stdout.strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    continue
+        raise
+
+
 async def probe_url(parsed_input, settings) -> dict:
     command = _command_base(parsed_input, settings, use_cookies=False)
     command.extend(["--dump-single-json", parsed_input.source_url])
     stdout, _ = await _run_command(command)
-    if "\n" in stdout:
-        stdout = stdout.splitlines()[0]
-    return json.loads(stdout)
+    data = _parse_probe_json(stdout)
+    # For playlists, fall back to the first entry so a quality menu still shows.
+    if isinstance(data, dict) and data.get("_type") == "playlist":
+        entries = [entry for entry in (data.get("entries") or []) if entry]
+        if entries:
+            data = entries[0]
+    return data
 
 
 def build_quick_youtube_options() -> list[dict]:

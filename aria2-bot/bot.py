@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 import html
 import inspect
 import json
@@ -22,7 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
 import config
 import cobalt
@@ -62,7 +61,6 @@ dp = Dispatcher()
 
 mtproto: TelegramClient | None = None
 
-URL_SCHEMES = ("http://", "https://", "ftp://", "magnet:?")
 BAR_FULL = "▓"
 BAR_EMPTY = "░"
 MAX_FORMAT_BUTTONS = 24
@@ -170,10 +168,6 @@ def guard_owner(func):
 
 def clean_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip()
-
-
-def url_digest(url: str) -> str:
-    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -636,10 +630,6 @@ async def cmd_delthumb(message: Message):
 # Downloads (intake)
 # --------------------------------------------------------------------------
 
-def _filter_link_parts(parts: list[str]) -> list[str]:
-    return [p for p in parts if p.startswith(("http://", "https://", "ftp://", "magnet:?"))]
-
-
 @dp.message(F.text, StateFilter(None))
 @guard
 async def handle_text(message: Message):
@@ -1057,12 +1047,10 @@ async def mega_download(parsed, option, settings, work_dir, status_msg=None):
     if not status_msg:
         raise RuntimeError("status message required")
 
-    async def progress_cb(done, total, speed):
-        pct = (done / total * 100) if total > 0 else 0
+    async def progress_cb(pct):
         try:
             await status_msg.edit_text(
-                f"🅼 <b>Downloading from Mega</b>\n<code>{bar(pct)}</code> {pct:.1f}%\n"
-                f"📦 {_fmt_size(done)} / {_fmt_size(total)}"
+                f"🅼 <b>Downloading from Mega</b>\n<code>{bar(pct)}</code> {pct:.1f}%"
             )
         except Exception:
             pass
@@ -1298,13 +1286,21 @@ async def send_media(chat_id: int, path: str, name: str, send_type: str, caption
         return
 
     if size <= config.MAX_MT_PROTO_SIZE and mtproto is not None:
+        attributes = [DocumentAttributeFilename(file_name=name)]
+        if send_type == "video":
+            width, height, duration = media.video_metadata(Path(path))
+            attributes.append(
+                DocumentAttributeVideo(
+                    duration=duration, w=width, h=height, supports_streaming=True
+                )
+            )
         await mtproto.send_file(
             chat_id,
             path,
             caption=caption,
             parse_mode="html",
             force_document=(send_type == "document"),
-            attributes=[DocumentAttributeFilename(file_name=name)],
+            attributes=attributes,
             part_size_kib=1024,
             file_size=size,
             progress_callback=progress_cb,

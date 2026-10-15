@@ -94,7 +94,6 @@ async def download_mega(url: str, dir_path: str, progress_cb=None) -> tuple[str,
         stderr=asyncio.subprocess.STDOUT,
     )
     assert proc.stdout is not None
-    size = 0
     name = ""
 
     async def consume() -> None:
@@ -108,10 +107,9 @@ async def download_mega(url: str, dir_path: str, progress_cb=None) -> tuple[str,
                 continue
             logger.debug("megadl: %s", text)
             m = re.search(r"([\d.]+) %", text)
-            if m:
-                pct = float(m.group(1))
-                if progress_cb and size > 0:
-                    await progress_cb(int(size * pct / 100.0), size, 0)
+            if m and progress_cb:
+                # megatools only reports a percentage, not byte totals.
+                await progress_cb(float(m.group(1)))
             m = re.search(r"Filename:\s*(.+)", text)
             if m:
                 name = m.group(1).strip()
